@@ -1,74 +1,157 @@
-# Manuscript Tracker
+<div align="center">
 
-A self-updating dashboard that watches your Gmail inbox(es), pulls in **only** the
-emails that report on the status of **your own submitted manuscripts**, and tracks
-each paper through its whole life — submission → review → revision → rejection →
-resubmission to another journal → acceptance → publication (with DOI) — so a
-rejected paper never gets lost in the daily flood of email and forgotten before
-you resubmit it.
+<img src="docs/hero.svg" alt="ORG Karur COMMS — email flows through a free-tier classifier into a dashboard of tracked manuscripts" width="880">
 
-It deliberately **ignores** predatory-journal solicitations, invitations to *peer
-review* someone else's paper, newsletters, and calls for papers.
+<br>
 
-- **Frontend:** a static dashboard (`index.html` + `assets/`), served by GitHub Pages.
-- **Backend:** a Node script (`scripts/sync-gmail.mjs`) run by GitHub Actions on a
-  schedule. It reads Gmail over the API, classifies each email with a **free-tier
-  LLM** (no paid API, no card), updates a JSON registry (`data/manuscripts.json`),
-  and commits the result. The dashboard just reads that JSON.
+**A rejected paper should never be lost in the daily flood of email.**<br>
+This watches the inbox so nobody has to.
 
-There is no server and no database — the git repo *is* the database.
+<br>
 
----
+<img alt="No server" src="https://img.shields.io/badge/server-none-0ea5e9?style=for-the-badge&labelColor=0f172a">
+<img alt="No database" src="https://img.shields.io/badge/database-the%20git%20repo-2563eb?style=for-the-badge&labelColor=0f172a">
+<img alt="Cost" src="https://img.shields.io/badge/cost-%240%20%2F%20month-16a34a?style=for-the-badge&labelColor=0f172a">
+<img alt="AI" src="https://img.shields.io/badge/AI-free%20tier%2C%20no%20card-7c3aed?style=for-the-badge&labelColor=0f172a">
+
+</div>
+
+<br>
+
+## What it does
+
+Journals send email. A lot of it, in nobody's particular format, mixed in with
+predatory solicitations and invitations to review other people's work. Somewhere
+in that stream is the message saying **your** paper was sent back with a
+fourteen-day deadline.
+
+This reads all of it, keeps only what is genuinely about your own manuscripts,
+and turns each paper into a single record that follows it the whole way:
+
+<div align="center">
+
+**submitted → in review → revision → rejected → resubmitted elsewhere → accepted → published, with DOI**
+
+</div>
+
+A rejection at one journal and a resubmission to the next are **one manuscript**,
+not two disconnected entries — so the trail never breaks at the exact moment it
+matters most.
+
+<br>
+
+## What you get
+
+<table>
+<tr>
+<td width="33%" valign="top">
+
+### ⏳ Deadlines that chase you
+
+A paper sent back for edits gets a **countdown**, taken from the journal's own
+words where it states one and from that journal's usual window where it doesn't.
+Reminders go out on **WhatsApp**, into **Google Chat**, and as a **GitHub issue** —
+three channels, none load-bearing alone.
+
+</td>
+<td width="33%" valign="top">
+
+### 🧠 Reads mail, costs nothing
+
+A keyword prefilter throws out the newsletters for free; only what survives
+reaches a **free-tier LLM**. No paid API, no card, no server. Predatory
+solicitations and peer-review invitations are recognised and logged with a
+reason, not silently dropped.
+
+</td>
+<td width="33%" valign="top">
+
+### ✋ Corrects itself, and takes yours
+
+Every field is re-derived from email every hour — so a correction you
+type by hand is **pinned**, and the sync leaves it alone. Marked *set by hand*
+wherever it shows, with a way back to automatic.
+
+</td>
+</tr>
+</table>
+
+<br>
 
 ## How an email becomes a tracked entry
 
-```
-Gmail inbox(es)
-   │  (poll every 3h, only mail since last sync)
-   ▼
-keyword prefilter  ──► obvious non-candidates dropped (no AI cost)
-   │
-   ▼
-free-tier LLM      ──► relevant?  ──no──► logged in data/excluded-log.json with a reason
-   │ yes                                   (predatory / review-invite / newsletter / unrelated)
-   ▼
-second model       ──► do the two agree?  ──no──► data/review-queue.json (never guessed)
-(off by default)   │ yes
-   ▼
-extract { title, journal, manuscript no., event_type, revision round, DOI, link }
-   │
-   ▼
-match against registry:
-   • same journal + manuscript number  → same submission
-   • else fuzzy title match (≥ 0.82)    → same manuscript, NEW journal = resubmission
-   • else                               → brand-new manuscript
-   │
-   ▼
-update status, append a timestamped timeline event, recompute the dashboard bucket
+```mermaid
+flowchart TD
+    A["📥 Gmail inboxes<br/><i>polled hourly, only mail since last sync</i>"] --> B{keyword prefilter}
+    B -->|obvious non-candidate| X["🗑️ excluded-log.json<br/><i>with a reason — no AI cost</i>"]
+    B -->|might matter| C{{"🧠 free-tier LLM"}}
+    C -->|not your manuscript| X
+    C -->|unsure| Q["🚩 review-queue.json<br/><i>flagged, never guessed</i>"]
+    C -->|yours| D["extract title · journal · manuscript no.<br/>event · revision round · DOI · link"]
+    D --> E{match against the registry}
+    E -->|same journal + number| F["same submission"]
+    E -->|title match ≥ 0.82, new journal| G["🔄 resubmission<br/><i>one manuscript, two journals</i>"]
+    E -->|no match| H["✨ brand-new manuscript"]
+    F --> I["📊 update status · append timeline · recompute bucket"]
+    G --> I
+    H --> I
+    I --> J["⏳ deadline?"]
+    J -->|yes| K["📱 WhatsApp · 💬 Google Chat · 🐙 GitHub issue"]
 ```
 
-### Status buckets (the dashboard action buttons)
+<br>
 
-| Button | What's in it |
-| --- | --- |
-| **Submissions** | Freshly submitted, acknowledged by a journal, awaiting first editorial check. |
-| **Needs action** | Rejected papers to resubmit elsewhere **and** papers sent back for edits before peer review. |
-| **In review** | Under peer review, revision in progress, transferred, or accepted-awaiting-publication. |
-| **Published** | Published, with DOI and article link. |
+## The dashboard
+
+Cards are ordered so the thing that gets worse while nobody looks comes first:
+**anything on a deadline leads, most urgent at the top**, overdue above due-soon.
+Everything else follows by recency.
+
+| Bucket | What's in it |
+| :-- | :-- |
+| 📤 **Submissions** | Freshly submitted, acknowledged by a journal, awaiting first editorial check. |
+| ❗ **Needs action** | Rejected papers to resubmit elsewhere **and** papers sent back for edits before peer review. |
+| ↻ **Revisions pending** | Peer review is done and the journal has asked for revisions — it is waiting on you. |
+| 🔍 **In review** | Under peer review, transferred, or accepted and awaiting publication. |
+| ✅ **Published** | Published, with DOI and article link. |
 
 A **revision requested** or **sent back for edits** event raises a pulsing action
-flag on the card, since both need your work — a revision even though the paper is
-still "in review". A sent-back paper also gets a **deadline**, and a WhatsApp
-reminder as it approaches; see [Deadline reminders on WhatsApp](#deadline-reminders-on-whatsapp).
+flag, since both need your work. They sit in different sections because they
+arrive at different stages — *Needs action* is before peer review, *Revisions
+pending* is after it — but both mean the manuscript is on your desk rather than
+the journal's. Those two events also carry a link straight to **the original
+email**, because what the editor actually asked for, and the marked-up
+manuscript, are in the message rather than in any summary of it.
 
-### Resubmission continuity
+<br>
 
-If a paper is rejected at Journal A and later submitted to Journal B, both journals
-appear as one manuscript with a **submission thread** — A marked *rejected*, B marked
-*active* — so the rejection→resubmission is a single continuous record, not two
-disconnected entries.
+## How it is built
+
+| | |
+| :-- | :-- |
+| **Frontend** | A static dashboard (`index.html` + `assets/`) on GitHub Pages. It reads one JSON file. |
+| **Backend** | `scripts/sync-gmail.mjs`, run by GitHub Actions every hour. Reads Gmail, classifies, commits. |
+| **Writes** | A Cloudflare Worker holds the one GitHub token, so no browser ever does. |
+| **Database** | There isn't one. **The git repo is the database** — every change to a manuscript is a commit. |
+
+<br>
 
 ---
+
+<br>
+
+> ### 📘 Setting this up for yourself, from scratch?
+>
+> **[SETUP-GUIDE.md](SETUP-GUIDE.md)** is a step-by-step walkthrough written for
+> someone who has never used GitHub and will not open a terminal. It starts from
+> a ZIP of this repository and ends with a working dashboard, WhatsApp reminders
+> included — every step in a browser, with the traps called out where they bite.
+> Also as [PDF](docs/Manuscript-Manager-Setup-Guide.pdf) and
+> [Word](docs/Manuscript-Manager-Setup-Guide.docx).
+>
+> The section below is the same ground in the compressed form a developer wants.
+
+<br>
 
 ## One-time setup
 
@@ -117,8 +200,8 @@ In the repo: **Settings → Secrets and variables → Actions → New repository
 | --- | --- |
 | `GMAIL_CLIENT_ID` | OAuth client ID from step 1 |
 | `GMAIL_CLIENT_SECRET` | OAuth client secret from step 1 |
-| `GMAIL_REFRESH_TOKEN_SATHISH` | refresh token for drsathishmuthu@gmail.com |
-| `GMAIL_REFRESH_TOKEN_DHIBIN` | refresh token for dhibinvikash1@gmail.com |
+| `GMAIL_REFRESH_TOKEN_1` | refresh token for the first inbox in `config/accounts.json` |
+| `GMAIL_REFRESH_TOKEN_2` | refresh token for the second |
 | **at least one** classifier key below | see [The classifier](#the-classifier) |
 
 | Classifier secret | Where to get it (all free, no card) |
@@ -143,15 +226,30 @@ grant every future workflow more than it needs, for no benefit.
 ### 5. Run it
 
 **Actions → Sync manuscript tracker → Run workflow** to do the first sync manually
-(the first run looks back 30 days). After that it runs every 3 hours automatically.
+(the first run looks back 30 days). After that it runs hourly, automatically.
 
 ---
 
 ## Adding or removing an inbox
 
 Edit `config/accounts.json` — add an object with the account's `label`, `email`, and
-a `refreshTokenEnv` name, mint a token for it (step 2), add that secret (step 3), and
-reference the secret in `.github/workflows/sync-manuscripts.yml`. No code changes.
+the next free `refreshTokenEnv` slot, then mint a token for it (step 2) and add that
+secret (step 3). No code changes and no workflow edit: the workflows already pass
+`GMAIL_REFRESH_TOKEN_1` … `_5` and `OUTLOOK_REFRESH_TOKEN_1` … `_2` through. A sixth
+mailbox is one more line in each of the three workflows that read mail.
+
+### Why the slots are numbered
+
+They used to be named after the two people whose inboxes these are, which was
+readable right up until someone else set up their own copy and found themselves
+typing two strangers' names into their own repository's secrets.
+
+The old names are still honoured when the matching slot is empty, so an existing
+install keeps running untouched. That fallback is not politeness: **a GitHub secret
+cannot be read back**, so renaming one is not a copy-and-paste — it means going
+through the whole OAuth flow again for a mailbox that may belong to a colleague who
+has to be there to sign in. Migrate whenever a token is being re-minted anyway, or
+never.
 
 ## Privacy note
 
@@ -305,7 +403,7 @@ email trail does not carry, and move it to a different section.
 
 **What you set by hand stays set.** This matters more than it looks. Every
 field on this dashboard is derived from email: the classifier reads each
-message and the sync folds it into the record, every three hours. So a
+message and the sync folds it into the record, every hour. So a
 correction that was merely written down would be silently undone by the next
 message from the journal — you would fix a title on Monday and find it wrong
 again on Tuesday, with nothing to say why.
@@ -554,7 +652,7 @@ Correct one with **Edit** and the reminders follow your date instead.
 ## Sync now
 
 The header has a **Sync now** button that runs the Gmail sync immediately
-instead of waiting for the three-hourly schedule. It shows a progress ring and
+instead of waiting for the hourly schedule. It shows a progress ring and
 a countdown; the estimate is the median duration of recent runs of this
 workflow, not a fixed guess, so it tracks reality as the workflow changes.
 
@@ -663,7 +761,7 @@ In the repository, **Settings → Secrets and variables → Actions**:
 | --- | --- |
 | `OUTLOOK_CLIENT_ID` | the Application (client) ID |
 | `OUTLOOK_CLIENT_SECRET` | only if you created one |
-| `OUTLOOK_REFRESH_TOKEN_DHIBIN` | the refresh token from step 2 |
+| `OUTLOOK_REFRESH_TOKEN_1` | the refresh token from step 2 |
 
 The next scheduled run picks the mailbox up. A missing credential skips only
 that account and logs which variable is absent — a half-configured Outlook

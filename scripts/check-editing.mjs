@@ -40,7 +40,7 @@ let registry = {
       id: "m-knees",
       title: "Origional Title As The Journal Typed It",
       titleNormalized: "origional title as the journal typed it",
-      bucket: "submissions",
+      bucket: "in_review",
       currentJournal: "Journal of Experimental Orthopaedics",
       currentStatus: "Submitted",
       currentManuscriptNumber: "JEO-1234",
@@ -221,9 +221,19 @@ async function check(name, fn, { expectErrors = false } = {}) {
   const context = await browser.newContext();
   const page = await context.newPage();
   const errors = [];
-  // Fonts come from Google and this sandbox has no route to them; that is the
-  // environment, not the app.
-  const ours = (t) => !/fonts\.(googleapis|gstatic)\.com|ERR_CONNECTION_RESET|favicon/.test(t);
+  /*
+   * Fonts come from Google and a sandbox may have no route to them -- that is
+   * the environment, not the app.
+   *
+   * ERR_CERT_AUTHORITY_INVALID belongs in the same list, and safely: both
+   * servers in this file are plain http on 127.0.0.1, so nothing first-party
+   * can produce a TLS error at all. One can only come from an external asset
+   * fetched through whatever proxy the machine is behind. Without this, a
+   * sandbox with an intercepting CA fails all twenty checks and says nothing
+   * about the app.
+   */
+  const ours = (t) =>
+    !/fonts\.(googleapis|gstatic)\.com|ERR_CONNECTION_RESET|ERR_CERT_AUTHORITY_INVALID|favicon/.test(t);
   page.on("console", (m) => { if (m.type() === "error" && ours(m.text())) errors.push(m.text()); });
   page.on("pageerror", (e) => { if (ours(String(e))) errors.push(String(e)); });
   try {
@@ -429,6 +439,42 @@ await check("a failure is reported in the form, not swallowed", async (page) => 
   assert(await page.isEnabled("#edit-save"), "the save button stayed disabled, so there is no way to retry");
 }, { expectErrors: true });
 
+await check("a live-but-old sync service is told apart from a missing one", async (page) => {
+  // A browser reports "not deployed", "DNS failed" and "CORS preflight
+  // rejected" as the same thrown fetch. The difference matters: one needs a
+  // redeploy, the other needs a deployment. /health is a simple GET, never
+  // preflighted, so it answers that question -- and this asserts both readings
+  // rather than only the happy one.
+  // Rather than driving the whole form, assert the message the module builds.
+  const messages = await page.evaluate(async () => {
+    const mod = await import("./assets/sync.js");
+    const out = {};
+    for (const healthOk of [true, false]) {
+      const real = window.fetch;
+      window.fetch = (url) =>
+        String(url).endsWith("/health") && healthOk
+          ? Promise.resolve(new Response("{}", { status: 200 }))
+          : Promise.reject(new TypeError("failed"));
+      try {
+        await mod.callProxy("/manuscripts/m-amend", {
+          method: "PATCH",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ title: "x" }),
+        });
+      } catch (e) {
+        out[healthOk ? "live" : "dead"] = e.message;
+      }
+      window.fetch = real;
+    }
+    return out;
+  });
+
+  assert(/redeploy/i.test(messages.live || ""), `live service did not say redeploy: ${messages.live}`);
+  assert(/older build/i.test(messages.live || ""), `live service did not name the cause: ${messages.live}`);
+  assert(/may not be\s+deployed/i.test(messages.dead || ""), `dead service message changed: ${messages.dead}`);
+  assert(!/redeploy/i.test(messages.dead || ""), "a missing service was told to redeploy");
+}, { expectErrors: true });
+
 await check("an amendment offers the original email, and a notification does not", async (page) => {
   // The summary in the timeline is this app's reading of the mail. On an
   // amendment that is not enough -- what the editor actually asked for, and
@@ -456,6 +502,341 @@ await check("an amendment offers the original email, and a notification does not
     (await page.$$(".tl-mail")).length === 0,
     "a plain submission notification offered the email as though it were an amendment"
   );
+});
+
+await check("every section chip is labelled, and none of them says undefined", async (page) => {
+  // The icon lived in a second list that adding "Revisions pending" missed, so
+  // the chip rendered the string "undefined" in the circle, sitting on top of
+  // the label. Nothing failed and nothing logged -- it could only be seen.
+  await startEditing(page);
+  const chips = await page.$$eval(".section-chip", (nodes) =>
+    nodes.map((n) => ({
+      bucket: n.dataset.bucket,
+      text: n.textContent.trim(),
+      icon: (n.querySelector(".bucket-icon")?.textContent || "").trim(),
+    }))
+  );
+  // Four, since submitted and under review became one section.
+  assert(chips.length === 4, `expected 4 section chips, got ${chips.length}`);
+  assert(!chips.some((c) => c.bucket === "submissions"),
+    "Submissions is still offered as a section to move a paper into");
+  for (const c of chips) {
+    assert(c.icon, `the ${c.bucket} chip has no icon`);
+    assert(!/undefined|null/.test(c.text), `the ${c.bucket} chip reads "${c.text}"`);
+  }
+  // And the icon must stay inside its circle rather than run under the label.
+  const overflowing = await page.$$eval(".section-chip", (nodes) =>
+    nodes.filter((n) => {
+      const i = n.querySelector(".bucket-icon");
+      return i && i.scrollWidth > i.clientWidth + 1;
+    }).map((n) => n.dataset.bucket)
+  );
+  assert(!overflowing.length, `icon overflows its circle on: ${overflowing.join(", ")}`);
+});
+
+await check("the buttons in the edit form line up", async (page) => {
+  // Cancel and Save are borrowed from two other dialogs, each with its own
+  // top margin. Side by side those margins became a visible stagger.
+  await startEditing(page);
+  const boxes = await page.$$eval(".edit-actions button", (nodes) =>
+    nodes.map((n) => {
+      const r = n.getBoundingClientRect();
+      return { id: n.id, top: Math.round(r.top), height: Math.round(r.height) };
+    })
+  );
+  assert(boxes.length === 3, `expected 3 buttons in the row, got ${boxes.length}`);
+  const tops = boxes.map((b) => b.top);
+  assert(Math.max(...tops) - Math.min(...tops) <= 1,
+    `the buttons do not share a baseline: ${JSON.stringify(boxes)}`);
+  const heights = boxes.map((b) => b.height);
+  assert(Math.max(...heights) - Math.min(...heights) <= 1,
+    `the buttons are different heights: ${JSON.stringify(boxes)}`);
+});
+
+await check("deleting asks first, and says what a delete does not undo", async (page) => {
+  await startEditing(page);
+  assert(await page.isHidden("#edit-delete-confirm"), "the confirmation was showing before it was asked for");
+  await page.click("#edit-delete");
+  await page.waitForSelector("#edit-delete-confirm:not([hidden])");
+
+  // Read the title from the record rather than naming it here: an earlier
+  // check corrects it, and this file's registry carries over between checks.
+  const title = registry.manuscripts.find((m) => m.id === "m-knees").title;
+  const text = await page.textContent("#edit-delete-confirm");
+  assert(text.includes(title), `the panel does not name the paper: ${text.slice(0, 120)}`);
+  assert(/new/i.test(text) && /file it again/i.test(text),
+    "the panel does not say a later email will bring it back");
+
+  // Save must not be reachable while a delete is being confirmed.
+  assert(await page.isHidden("#edit-save"), "Save was still offered mid-confirmation");
+
+  await page.click("#edit-delete-cancel");
+  await page.waitForSelector("#edit-delete-confirm", { state: "hidden" });
+  assert(registry.manuscripts.some((m) => m.id === "m-knees"), "backing out still deleted it");
+  assert(await page.isVisible("#edit-save"), "Save did not come back after backing out");
+});
+
+await check("a confirmed delete removes the card, the record and nothing else", async (page) => {
+  // The registry is shared by every check in this file, so put it back --
+  // otherwise the checks after this one open a drawer on a paper that is gone.
+  const snapshot = JSON.parse(JSON.stringify(registry));
+  try {
+    const others = registry.manuscripts.filter((m) => m.id !== "m-knees").map((m) => m.id);
+    const bucket = registry.manuscripts.find((m) => m.id === "m-knees").bucket;
+    const before = Number(await page.textContent(`[data-count="${bucket}"]`));
+
+    await startEditing(page);
+    await page.click("#edit-delete");
+    await page.click("#edit-delete-go");
+    await page.waitForSelector("#drawer", { state: "hidden" });
+
+    assert(!(await page.$('.card[data-id="m-knees"]')), "the card is still on the page");
+    assert(!registry.manuscripts.some((m) => m.id === "m-knees"), "the record is still in the file");
+    assert(
+      Number(await page.textContent(`[data-count="${bucket}"]`)) === before - 1,
+      `the ${bucket} count did not go down`
+    );
+    for (const id of others) {
+      assert(registry.manuscripts.some((m) => m.id === id), `deleting one manuscript took ${id} with it`);
+    }
+  } finally {
+    registry = snapshot;
+  }
+});
+
+await check("a paper nobody has heard about is marked silent", async (page) => {
+  // Sixty-two of 128 real papers sit in Submissions, median 76 days quiet.
+  // Without this the section cannot tell waiting from lost.
+  const snapshot = JSON.parse(JSON.stringify(registry));
+  try {
+    const old = registry.manuscripts.find((m) => m.id === "m-knees");
+    old.bucket = "in_review";
+    old.updatedAt = new Date(Date.now() - 200 * 86400000).toISOString();
+    await page.reload();
+    await unlock(page);
+
+    const chip = await page.$('.card[data-id="m-knees"] .silence-chip');
+    assert(chip, "a paper silent for 200 days carries no signal at all");
+    assert(/silent/i.test(await chip.textContent()), "the chip does not say what it means");
+
+    // And it must stay a signal: a recent paper gets nothing.
+    const fresh = await page.$$('.card:not([data-id="m-knees"]) .silence-chip');
+    assert(!fresh.length, "every card is badged, which makes the badge wallpaper");
+  } finally {
+    registry = snapshot;
+  }
+});
+
+await check("two records for one paper can be merged back together", async (page) => {
+  const snapshot = JSON.parse(JSON.stringify(registry));
+  try {
+    // The way a paper really splits: a revision round the matcher did not
+    // recognise as the same submission.
+    registry.manuscripts.push({
+      id: "m-knees-split",
+      title: "Origional Title As The Journal Typed It",
+      titleNormalized: "origional title as the journal typed it",
+      bucket: "in_review",
+      currentJournal: "Journal of Experimental Orthopaedics",
+      currentStatus: "Under review",
+      currentManuscriptNumber: "JEO-1234R2",
+      authorAccounts: ["dhibin@example.org"],
+      createdAt: "2026-08-25T10:00:00.000Z",
+      updatedAt: "2026-08-25T10:00:00.000Z",
+      submissions: [{
+        journal: "Journal of Experimental Orthopaedics", manuscriptNumber: "JEO-1234R2",
+        submittedDate: "2026-08-25T10:00:00.000Z", outcome: "active", status: "under_review", statusHistory: [],
+      }],
+      timeline: [{
+        timestamp: "2026-08-25T10:00:00.000Z", journal: "Journal of Experimental Orthopaedics",
+        eventType: "under_review", label: "Under review",
+        source: { threadId: "t-split", messageId: "m-split", subject: "Revision received", from: "x@example.org" },
+      }],
+      events: [],
+    });
+    await page.reload();
+    await unlock(page);
+
+    const before = registry.manuscripts.find((m) => m.id === "m-knees").timeline.length;
+    await startEditing(page);
+
+    const option = await page.$('#merge-into option[value="m-knees-split"]');
+    assert(option, "the duplicate was not offered as something to merge");
+
+    await page.selectOption("#merge-into", "m-knees-split");
+    page.once("dialog", (d) => d.accept());
+    await page.click("#edit-merge");
+    await page.waitForFunction(() => !document.querySelector('.card[data-id="m-knees-split"]'));
+
+    const kept = registry.manuscripts.find((m) => m.id === "m-knees");
+    assert(!registry.manuscripts.some((m) => m.id === "m-knees-split"), "the duplicate is still in the file");
+    assert(kept.timeline.length === before + 1, `timeline is ${kept.timeline.length}, expected ${before + 1}`);
+    assert(kept.submissions.some((x) => x.manuscriptNumber === "JEO-1234R2"), "the other half's submission was lost");
+    assert(!(registry.tombstones || []).length, "a merge suppressed the paper as if it had been deleted");
+  } finally {
+    registry = snapshot;
+  }
+});
+
+await check("journals are listed, opened, and left again", async (page) => {
+  await page.click('[data-bucket="journals"]');
+  await page.waitForSelector(".journal-card");
+
+  const names = await page.$$eval(".journal-card .card-title", (n) => n.map((x) => x.textContent.trim()));
+  assert(names.includes("Journal of Experimental Orthopaedics"),
+    `the journals are ${JSON.stringify(names)}`);
+
+  // Opening one shows its papers, not the whole board.
+  await page.click('.journal-card[data-journal="Journal of Experimental Orthopaedics"]');
+  await page.waitForSelector(".journal-paper");
+  const heading = await page.textContent(".journal-heading");
+  assert(heading.includes("Journal of Experimental Orthopaedics"), `heading reads "${heading}"`);
+  const shown = await page.$$eval(".journal-paper .card-title", (n) => n.map((x) => x.textContent.trim()));
+  assert(shown.length, "the journal opened onto nothing");
+
+  // And each paper says where it stands WITH THIS JOURNAL.
+  const stage = await page.textContent(".journal-paper .pill");
+  assert(stage.trim().length, "a paper is listed with no stage against it");
+
+  // A paper still opens its own drawer from here.
+  await page.click(".journal-paper");
+  await page.waitForSelector("#drawer:not([hidden])");
+  await page.click("#drawer-close");
+
+  await page.click("#journal-back");
+  await page.waitForSelector(".journal-card");
+  assert(!(await page.$(".journal-paper")), "backing out stayed inside the journal");
+});
+
+await check("a rejection still counts as that journal's history", async (page) => {
+  // Grouped by submission, not by where the paper is now: a paper rejected
+  // here and living elsewhere is the most useful thing this journal has said.
+  const snapshot = JSON.parse(JSON.stringify(registry));
+  try {
+    const m = registry.manuscripts.find((x) => x.id === "m-knees");
+    m.bucket = "in_review";
+    m.currentJournal = "Somewhere Else Entirely";
+    m.submissions = [{
+      journal: "Journal of Experimental Orthopaedics", manuscriptNumber: "JEO-1234",
+      submittedDate: "2026-03-01T10:00:00.000Z", outcome: "rejected", status: "rejected", statusHistory: [],
+    }];
+    await page.reload();
+    await unlock(page);
+
+    await page.click('[data-bucket="journals"]');
+    await page.waitForSelector(".journal-card");
+    await page.click('.journal-card[data-journal="Journal of Experimental Orthopaedics"]');
+    await page.waitForSelector(".journal-paper");
+
+    const stage = (await page.textContent(".journal-paper .pill")).trim();
+    assert(/rejected/i.test(stage),
+      `the paper reads "${stage}" under the journal that rejected it, not its outcome there`);
+  } finally {
+    registry = snapshot;
+  }
+});
+
+await check("a section this build does not know does not blank the page", async (page) => {
+  // Merging "Submissions" away left BUCKET_META without that key, and reading
+  // it directly threw -- taking the whole card list with it. A browser holding
+  // yesterday's data file would have shown an empty dashboard rather than a
+  // card it could not label.
+  const snapshot = JSON.parse(JSON.stringify(registry));
+  try {
+    registry.manuscripts.find((m) => m.id === "m-knees").bucket = "submissions";
+    await page.reload();
+    await unlock(page);
+
+    const cards = await page.$$("#cards .card");
+    assert(cards.length === registry.manuscripts.length,
+      `${cards.length} of ${registry.manuscripts.length} cards rendered`);
+    const pill = await page.textContent('.card[data-id="m-knees"] .pill');
+    assert(pill.trim().length, "the card rendered with no section label at all");
+  } finally {
+    registry = snapshot;
+  }
+});
+
+await check("any card can be merged, not only the ones that look alike", async (page) => {
+  // The pair this exists for: "…as Safe as Three-Level ACDF" and "…as Safe as
+  // Anterior Cervical Discectomy and Fusion" are one paper whose title a
+  // journal truncated. They score 0.70 against each other -- well under the
+  // matcher's 0.82 -- so a picker limited to suggestions could not reach them,
+  // which is the one case a person needs a manual merge for.
+  const snapshot = JSON.parse(JSON.stringify(registry));
+  try {
+    registry.manuscripts.push({
+      id: "m-unlike",
+      title: "Bone Cement Leakage After Vertebroplasty: An Entirely Different Paper",
+      titleNormalized: "bone cement leakage after vertebroplasty an entirely different paper",
+      bucket: "in_review", currentJournal: "Journal of Spine", currentStatus: "Submitted",
+      authorAccounts: [], createdAt: "2026-04-01T00:00:00.000Z", updatedAt: "2026-04-01T00:00:00.000Z",
+      submissions: [], timeline: [{
+        timestamp: "2026-04-01T00:00:00.000Z", journal: "Journal of Spine",
+        eventType: "new_submission", label: "Submitted",
+        source: { threadId: "t-u", messageId: "m-u", subject: "Received", from: "x@example.org" },
+      }], events: [],
+    });
+    await page.reload();
+    await unlock(page);
+    await startEditing(page);
+
+    const option = await page.$('#merge-into option[value="m-unlike"]');
+    assert(option, "a dissimilar card was not offered at all, so it could never be merged by hand");
+
+    const groups = await page.$$eval("#merge-into optgroup", (n) => n.map((x) => x.label));
+    assert(groups.length >= 1, "the options are not grouped, so suggestions do not stand out");
+
+    // Every other manuscript must be reachable, not just a shortlist.
+    const offered = await page.$$eval("#merge-into option[value]", (n) =>
+      n.map((x) => x.value).filter(Boolean));
+    const others = registry.manuscripts.filter((x) => x.id !== "m-knees").map((x) => x.id);
+    for (const id of others) {
+      assert(offered.includes(id), `${id} cannot be chosen, so it can never be merged`);
+    }
+    assert(!offered.includes("m-knees"), "a card is offered to merge into itself");
+  } finally {
+    registry = snapshot;
+  }
+});
+
+await check("a journal's papers are listed in date order", async (page) => {
+  const snapshot = JSON.parse(JSON.stringify(registry));
+  try {
+    const at = (id, title, when) => ({
+      id, title, titleNormalized: title.toLowerCase(), bucket: "in_review",
+      currentJournal: "Journal of Order", currentStatus: "Submitted",
+      authorAccounts: [], createdAt: when, updatedAt: "2026-09-01T00:00:00.000Z",
+      submissions: [{
+        journal: "Journal of Order", manuscriptNumber: id, submittedDate: when,
+        outcome: "active", status: "new_submission", statusHistory: [],
+      }],
+      timeline: [{
+        timestamp: when, journal: "Journal of Order", eventType: "new_submission", label: "Submitted",
+        source: { threadId: "t-" + id, messageId: "m-" + id, subject: "Received", from: "x@example.org" },
+      }], events: [],
+    });
+    // Deliberately out of order, and with identical updatedAt -- the old sort
+    // used updatedAt, so any unrelated email could shuffle a journal's history.
+    registry.manuscripts.push(at("ord-b", "Middle Paper", "2026-05-01T00:00:00.000Z"));
+    registry.manuscripts.push(at("ord-c", "Newest Paper", "2026-08-01T00:00:00.000Z"));
+    registry.manuscripts.push(at("ord-a", "Oldest Paper", "2026-01-01T00:00:00.000Z"));
+    await page.reload();
+    await unlock(page);
+
+    await page.click('[data-bucket="journals"]');
+    await page.waitForSelector(".journal-card");
+    await page.click('.journal-card[data-journal="Journal of Order"]');
+    await page.waitForSelector(".journal-paper");
+
+    const order = await page.$$eval(".journal-paper", (n) => n.map((x) => x.dataset.id));
+    assert(order.join() === "ord-c,ord-b,ord-a", `listed as ${order.join()}, not newest-first by date`);
+
+    const when = await page.textContent(".journal-paper .card-when");
+    assert(/submitted/i.test(when), `the row does not show its date: "${when}"`);
+  } finally {
+    registry = snapshot;
+  }
 });
 
 await check("a resumed session is asked for the password before it can save", async (page) => {

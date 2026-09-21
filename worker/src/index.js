@@ -28,7 +28,46 @@
 const OWNER = "ORG-Karur-DataCenter";
 const REPO = "Manuscript-Manager";
 const WORKFLOW = "sync-manuscripts.yml";
-const BRANCH = "main";
+
+/*
+ * The branch to dispatch on, and why it is not simply a constant.
+ *
+ * It was "main" here, and before that a development branch name. This Worker
+ * is deployed separately from the repository, so a constant here goes stale
+ * the moment a branch is renamed or removed -- and stays stale until somebody
+ * remembers to redeploy. That is exactly what happened: the branch was
+ * deleted, the deployed Worker kept asking for it, and Sync answered "No ref
+ * found for claude/manuscript-tracking-app-jhj4p7" with nothing to suggest the
+ * cause was a stale deployment rather than a broken button.
+ *
+ * Asking GitHub for the repository's default branch removes the class of
+ * fault: renaming or deleting a branch can no longer desynchronise a Worker
+ * nobody thought to redeploy. BRANCH_FALLBACK covers the case where that
+ * lookup itself fails, so a GitHub blip degrades to the old behaviour rather
+ * than to no sync at all.
+ */
+const BRANCH_FALLBACK = "main";
+let cachedBranch = null;
+
+/*
+ * Tests drive several different repositories through one module instance, and
+ * a cache that outlives them would make the second test assert the first
+ * one's answer. Exported for that, and used nowhere in the request path.
+ */
+export function __resetBranchCache() {
+  cachedBranch = null;
+}
+
+async function defaultBranch(env) {
+  if (cachedBranch) return cachedBranch;
+  try {
+    const repo = await gh("", env);
+    cachedBranch = repo?.default_branch || BRANCH_FALLBACK;
+  } catch {
+    cachedBranch = BRANCH_FALLBACK;
+  }
+  return cachedBranch;
+}
 const GH = `https://api.github.com/repos/${OWNER}/${REPO}`;
 const FALLBACK_SECONDS = 165;
 const DATA_PATH = "data/manuscripts.json";
@@ -48,10 +87,13 @@ const OVERRIDABLE = [
   "publicationLink",
   "notes",
 ];
-const BUCKETS = ["submissions", "needs_action", "in_review", "published"];
+const BUCKETS = ["submissions", "needs_action", "revisions_pending", "in_review", "published"];
 
+// In step with registry.mjs normalizeTitle, ampersand rule included: an
+// exact title is what identifies a paper, so the two must agree on what
+// "exact" means.
 const normalizeTitle = (t) =>
-  (t || "").toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+  (t || "").toLowerCase().replace(/&/g, " and ").normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
 
 /**
@@ -116,6 +158,21 @@ function safeEqual(a, b) {
   return diff === 0;
 }
 
+/*
+ * What this build can do, in one list, so a browser can be shown it.
+ *
+ * A Worker is deployed by hand and separately from this repository, so the
+ * code here and the code running are two different things -- and the way that
+ * shows up is a CORS rejection, which a browser reports identically to a
+ * Worker that does not exist. It has now happened twice: once when editing
+ * added PATCH, and again when deleting added DELETE.
+ *
+ * So the same list that gates CORS is also reported by /health, which needs no
+ * password. Loading /health in the address bar answers "is what is deployed
+ * current?" without guessing.
+ */
+const ALLOWED_METHODS = ["GET", "POST", "PATCH", "DELETE", "OPTIONS"];
+
 function corsHeaders(env, request) {
   const allowed = env.ALLOWED_ORIGIN || "*";
   const origin = request.headers.get("Origin") || "";
@@ -125,7 +182,7 @@ function corsHeaders(env, request) {
   return {
     "Access-Control-Allow-Origin": value,
     "Access-Control-Allow-Headers": "Authorization, Content-Type",
-    "Access-Control-Allow-Methods": "GET, POST, PATCH, OPTIONS",
+    "Access-Control-Allow-Methods": ALLOWED_METHODS.join(", "),
     "Access-Control-Max-Age": "86400",
     Vary: "Origin",
   };
@@ -212,9 +269,12 @@ function encodeBase64(text) {
  */
 async function commitEdit(id, patch, env) {
   let lastConflict = null;
+  // Read and write the same branch the sync runs on, resolved once rather than
+  // hardcoded -- see defaultBranch above for why a constant here rots.
+  const branch = await defaultBranch(env);
 
   for (let attempt = 0; attempt < 4; attempt++) {
-    const file = await gh(`/contents/${DATA_PATH}?ref=${BRANCH}&_=${Date.now()}`, env);
+    const file = await gh(`/contents/${DATA_PATH}?ref=${branch}&_=${Date.now()}`, env);
     const registry = JSON.parse(decodeBase64(file.content));
 
     const manuscript = (registry.manuscripts || []).find((m) => m.id === id);
@@ -237,7 +297,7 @@ async function commitEdit(id, patch, env) {
           message: commitMessage(manuscript, changes),
           content: encodeBase64(`${JSON.stringify(registry, null, 2)}\n`),
           sha: file.sha,
-          branch: BRANCH,
+          branch,
         }),
       });
       return { changes, manuscript, unchanged: false };
@@ -269,6 +329,249 @@ function commitMessage(manuscript, changes) {
     .map((c) => (c.released ? `${c.field}: back to automatic` : `${c.field}: ${c.to}`))
     .join("\n");
   return `${summary}\n\n${detail}`;
+}
+
+/**
+ * Read the registry, remove one manuscript, commit it back.
+ *
+ * Same stale-SHA loop as commitEdit and for the same reason: the sync rewrites
+ * this file every hour. A delete cannot be replayed as blindly as an edit,
+ * though -- if the re-read no longer has the manuscript, someone else already
+ * removed it, and that is the outcome the caller wanted rather than an error.
+ *
+ * WHAT A DELETE DOES NOT DO. It removes the record, not the emails it was
+ * built from. Those message ids stay in the sync's seenIds, so the mail
+ * already read will not rebuild it -- but a NEW email about the same paper
+ * will file it afresh, because nothing here says the paper does not exist.
+ * That is deliberate: a tracker that could be told to permanently ignore a
+ * real journal decision is a tracker that loses one. The dashboard says so
+ * before it asks for confirmation.
+ */
+async function commitDelete(id, env) {
+  let lastConflict = null;
+  const branch = await defaultBranch(env);
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const file = await gh(`/contents/${DATA_PATH}?ref=${branch}&_=${Date.now()}`, env);
+    const registry = JSON.parse(decodeBase64(file.content));
+
+    const list = registry.manuscripts || [];
+    const index = list.findIndex((m) => m.id === id);
+    if (index === -1) {
+      // Not an error on a replay: a delete that finds nothing to delete has
+      // already happened. Only say so on the first look.
+      if (attempt > 0) return { deleted: null, alreadyGone: true };
+      const err = new Error("That manuscript is no longer in the tracker.");
+      err.status = 404;
+      throw err;
+    }
+
+    const [manuscript] = list.splice(index, 1);
+    registry.manuscripts = list;
+    const at = new Date().toISOString();
+    registry.editedAt = at;
+
+    /*
+     * Leave a marker, or the delete does not hold.
+     *
+     * Removing the record does not remove the mail it was built from, so the
+     * next email about the same paper filed it again -- one paper here was
+     * deleted on 10 September, returned, and was deleted again on 12. The sync
+     * reads these and declines to rebuild anything it recognises.
+     *
+     * Kept narrow deliberately: this paper's own manuscript numbers, with the
+     * revision round stripped, and its exact title. Not a ban on the subject.
+     * It is a plain list in the data file, so undoing one is an edit.
+     *
+     * The rule is duplicated in registry.mjs, which the Worker cannot import
+     * from; tombstoneFor there is the definition, and check-worker asserts the
+     * two agree.
+     */
+    registry.tombstones = [
+      ...(registry.tombstones || []).filter((t) => t.id !== manuscript.id),
+      {
+        id: manuscript.id,
+        title: manuscript.title,
+        titleNormalized: normalizeTitle(manuscript.title),
+        numbers: [
+          ...new Set(
+            (manuscript.submissions || [])
+              .map((sub) => sub.manuscriptNumber)
+              .filter(Boolean)
+              .map((n) => n.trim().replace(/[._\s-]*R\d+$/i, "").toLowerCase())
+          ),
+        ].filter(Boolean),
+        deletedAt: at,
+      },
+    ];
+
+    try {
+      await gh(`/contents/${DATA_PATH}`, env, {
+        method: "PUT",
+        body: JSON.stringify({
+          message: deleteMessage(manuscript),
+          content: encodeBase64(`${JSON.stringify(registry, null, 2)}\n`),
+          sha: file.sha,
+          branch,
+        }),
+      });
+      return { deleted: manuscript, alreadyGone: false };
+    } catch (err) {
+      if (err.status !== 409 && err.status !== 422) throw err;
+      lastConflict = err;
+      await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+    }
+  }
+
+  const err = new Error(
+    "The tracker was being updated at the same moment and the deletion could not be saved. Try again."
+  );
+  err.status = 503;
+  err.cause = lastConflict;
+  throw err;
+}
+
+/**
+ * Fold one manuscript into another and keep both halves of the history.
+ *
+ * The matcher can split a paper in two -- a revision number it did not
+ * recognise, a title a journal retyped -- and until now the only repair was to
+ * delete one, which threw away whichever events had landed on it. This
+ * registry currently holds two such pairs, one of them the same paper at two
+ * journals, which is exactly the chain the tracker exists to show as one
+ * story.
+ *
+ * The surviving record keeps its own id, title and any pinned fields: it is
+ * the one the person chose to keep. Everything the other has that it lacks is
+ * carried across -- submissions, timeline, author accounts -- and the loser's
+ * title becomes an alias so later email still matches. Timeline entries are
+ * de-duplicated by message id, because the reason a paper split is often that
+ * both records were fed the same notice.
+ *
+ * No tombstone: the paper is not gone, it moved.
+ */
+async function commitMerge(keepId, mergeId, env) {
+  if (keepId === mergeId) {
+    const err = new Error("A manuscript cannot be merged into itself.");
+    err.status = 400;
+    throw err;
+  }
+
+  let lastConflict = null;
+  const branch = await defaultBranch(env);
+
+  for (let attempt = 0; attempt < 4; attempt++) {
+    const file = await gh(`/contents/${DATA_PATH}?ref=${branch}&_=${Date.now()}`, env);
+    const registry = JSON.parse(decodeBase64(file.content));
+    const list = registry.manuscripts || [];
+
+    const keep = list.find((m) => m.id === keepId);
+    const drop = list.find((m) => m.id === mergeId);
+    if (!keep || !drop) {
+      const err = new Error("One of those manuscripts is no longer in the tracker.");
+      err.status = 404;
+      throw err;
+    }
+
+    const seen = new Set((keep.timeline || []).map((t) => t.source?.messageId).filter(Boolean));
+    const broughtOver = (drop.timeline || []).filter(
+      (t) => !t.source?.messageId || !seen.has(t.source.messageId)
+    );
+    keep.timeline = [...(keep.timeline || []), ...broughtOver].sort(
+      (a, b) => new Date(a.timestamp) - new Date(b.timestamp)
+    );
+
+    const haveSubmission = new Set(
+      (keep.submissions || []).map((x) => `${(x.journal || "").toLowerCase()}|${x.manuscriptNumber || ""}`)
+    );
+    for (const sub of drop.submissions || []) {
+      const key = `${(sub.journal || "").toLowerCase()}|${sub.manuscriptNumber || ""}`;
+      if (!haveSubmission.has(key)) {
+        keep.submissions = [...(keep.submissions || []), sub];
+        haveSubmission.add(key);
+      }
+    }
+    keep.submissions.sort((a, b) => new Date(a.submittedDate || 0) - new Date(b.submittedDate || 0));
+
+    keep.authorAccounts = [...new Set([...(keep.authorAccounts || []), ...(drop.authorAccounts || [])])];
+    keep.titleAliases = [
+      ...new Set([
+        ...(keep.titleAliases || []),
+        ...(drop.titleAliases || []),
+        ...(drop.title && drop.title !== keep.title ? [drop.title] : []),
+      ]),
+    ];
+    // Facts, not status: take them from whichever record has them.
+    keep.doi ||= drop.doi || null;
+    keep.publicationLink ||= drop.publicationLink || null;
+    // A flag on either half is a flag on the whole.
+    if (drop.needsReview) {
+      keep.needsReview = true;
+      keep.reviewReason ||= drop.reviewReason || null;
+    }
+
+    const newest = keep.timeline[keep.timeline.length - 1];
+    keep.updatedAt = newest ? newest.timestamp : keep.updatedAt;
+    keep.createdAt = [keep.createdAt, drop.createdAt].filter(Boolean).sort()[0] || keep.createdAt;
+    keep.edits = [
+      ...(keep.edits || []),
+      {
+        at: new Date().toISOString(),
+        by: "dashboard",
+        changes: [{ field: "merged", from: drop.id, to: keep.id, events: broughtOver.length }],
+      },
+    ];
+
+    registry.manuscripts = list.filter((m) => m.id !== mergeId);
+    registry.editedAt = new Date().toISOString();
+
+    try {
+      await gh(`/contents/${DATA_PATH}`, env, {
+        method: "PUT",
+        body: JSON.stringify({
+          message:
+            `Merge "${(drop.title || "").slice(0, 50)}" into "${(keep.title || "").slice(0, 50)}"\n\n` +
+            `kept: ${keep.id}\nmerged away: ${drop.id}\n` +
+            `timeline entries carried over: ${broughtOver.length}\n` +
+            `submissions after merge: ${keep.submissions.length}`,
+          content: encodeBase64(`${JSON.stringify(registry, null, 2)}\n`),
+          sha: file.sha,
+          branch,
+        }),
+      });
+      return { manuscript: keep, mergedAway: drop.id, events: broughtOver.length };
+    } catch (err) {
+      if (err.status !== 409 && err.status !== 422) throw err;
+      lastConflict = err;
+      await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+    }
+  }
+
+  const err = new Error(
+    "The tracker was being updated at the same moment and the merge could not be saved. Try again."
+  );
+  err.status = 503;
+  err.cause = lastConflict;
+  throw err;
+}
+
+/**
+ * A delete is the one edit git cannot show as a diff of fields, so the message
+ * has to carry what was removed -- enough to find the paper again in history.
+ */
+function deleteMessage(manuscript) {
+  const title = (manuscript.title || "manuscript").slice(0, 60);
+  const detail = [
+    `id: ${manuscript.id}`,
+    manuscript.currentJournal ? `journal: ${manuscript.currentJournal}` : null,
+    manuscript.currentManuscriptNumber ? `number: ${manuscript.currentManuscriptNumber}` : null,
+    `section: ${manuscript.bucket}`,
+    `timeline entries removed: ${(manuscript.timeline || []).length}`,
+    "",
+    "Removed from the dashboard. The emails behind it are untouched, so a new",
+    "message about this paper will file it again.",
+  ].filter(Boolean).join("\n");
+  return `Delete "${title}"\n\n${detail}`;
 }
 
 /** A dispatch returns no body, so the new run has to be found by its start time. */
@@ -304,6 +607,9 @@ export default {
         ok: true,
         configured: missing.length === 0,
         missing,
+        // The build's own account of itself. "DELETE" here means a deployed
+        // Worker that can delete; its absence means this one predates it.
+        methods: ALLOWED_METHODS,
         // Everything else this Worker can see, so a misspelled name shows up
         // as an unexpected entry rather than as silence. Names only.
         secretsFound: Object.keys(env).filter((k) => typeof env[k] === "string" && k !== "ALLOWED_ORIGIN"),
@@ -322,10 +628,26 @@ export default {
       if (url.pathname === "/sync" && request.method === "POST") {
         const requestedAt = Date.now();
         const estimate = await estimateSeconds(env);
-        await gh(`/actions/workflows/${WORKFLOW}/dispatches`, env, {
-          method: "POST",
-          body: JSON.stringify({ ref: BRANCH }),
-        });
+        const ref = await defaultBranch(env);
+        try {
+          await gh(`/actions/workflows/${WORKFLOW}/dispatches`, env, {
+            method: "POST",
+            body: JSON.stringify({ ref }),
+          });
+        } catch (err) {
+          // 422 "No ref found" from a dispatch means the branch this Worker
+          // asked for is not there. Raw, it reads as a broken button.
+          if (err.status === 422 && /No ref found/i.test(err.message)) {
+            return json({
+              error:
+                `The sync service asked GitHub to run on branch "${ref}", which does not exist. ` +
+                "If that is an old branch name, this Worker is running a build from before it " +
+                "changed — redeploy it with `wrangler deploy` from the worker/ directory.",
+              recoverable: true,
+            }, 502, env, request);
+          }
+          throw err;
+        }
         const run = await findRunSince(requestedAt, env);
         if (!run) {
           return json({ error: "The sync started but its run could not be found." }, 502, env, request);
@@ -353,6 +675,30 @@ export default {
         }, 200, env, request);
       }
 
+      if (edit && request.method === "DELETE") {
+        const result = await commitDelete(edit[1], env);
+        return json({
+          ok: true,
+          alreadyGone: result.alreadyGone,
+          deleted: result.deleted,
+        }, 200, env, request);
+      }
+
+      const merge = url.pathname.match(/^\/manuscripts\/([A-Za-z0-9_-]+)\/merge$/);
+      if (merge && request.method === "POST") {
+        const body = await request.json().catch(() => null);
+        if (!body || typeof body.from !== "string" || !body.from) {
+          return json({ error: 'Send {"from": "<id of the record to merge away>"}.' }, 400, env, request);
+        }
+        const result = await commitMerge(merge[1], body.from, env);
+        return json({
+          ok: true,
+          manuscript: result.manuscript,
+          mergedAway: result.mergedAway,
+          events: result.events,
+        }, 200, env, request);
+      }
+
       const match = url.pathname.match(/^\/sync\/(\d+)$/);
       if (match && request.method === "GET") {
         const run = await gh(`/actions/runs/${match[1]}`, env);
@@ -366,8 +712,31 @@ export default {
 
       return json({ error: "Not found." }, 404, env, request);
     } catch (err) {
+      /*
+       * A 404 from GitHub itself is not the same as a 404 this Worker raised.
+       *
+       * "That manuscript is no longer in the tracker" is precise and belongs to
+       * the caller. But a raw `GitHub 404: {"message":"Not Found"}` from reading
+       * the data file means the BRANCH or the file is not there -- and by far
+       * the likeliest reason is that this Worker is running a build from before
+       * a branch was renamed, since the branch it asks for is baked into
+       * whichever build is deployed. Passing that through as-is showed the
+       * person raw API JSON for a problem that is one command to fix.
+       */
+      if (err.status === 404 && /^GitHub 404/.test(err.message || "")) {
+        return json({
+          error:
+            "GitHub could not find the tracker data on the branch this sync service " +
+            "is asking for. That usually means the service is running an older " +
+            "build, from before the branch changed — redeploy it with `wrangler " +
+            "deploy` from the worker/ directory. (GitHub said: " +
+            `${(err.message || "").slice(0, 120)})`,
+          recoverable: true,
+        }, 502, env, request);
+      }
+
       // An edit rejected for naming a field that does not exist is the caller's
-      // mistake and should read as one; 404 and 503 are already precise.
+      // mistake and should read as one; 400, our own 404 and 503 are precise.
       if (err.status === 400 || err.status === 404 || err.status === 503) {
         return json({ error: err.message }, err.status, env, request);
       }

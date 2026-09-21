@@ -52,9 +52,13 @@ export const FIELDS = [
 ];
 
 export const SECTIONS = [
-  { bucket: "submissions", label: "Submissions" },
+  // "Submissions" and "In review" were one thing wearing two names: not every
+  // journal acknowledges a submission, and none announces that a paper has
+  // reached an editor, so which section a paper landed in said more about the
+  // journal's mail habits than about the paper.
+  { bucket: "in_review", label: "With the journal" },
   { bucket: "needs_action", label: "Needs action" },
-  { bucket: "in_review", label: "In review" },
+  { bucket: "revisions_pending", label: "Revisions pending" },
   { bucket: "published", label: "Published" },
 ];
 
@@ -102,6 +106,61 @@ export async function saveEdit(id, patch) {
     body: JSON.stringify(patch),
   });
   return body;
+}
+
+/**
+ * Fold another record into this one.
+ *
+ * The matcher can split one paper in two -- an unrecognised revision number, a
+ * title a journal retyped -- and until now the only repair was deleting one
+ * half, which threw its events away. This keeps both histories under the
+ * record you chose to keep, and keeps the other's title as an alias so later
+ * email still finds it.
+ */
+export async function mergeManuscripts(keepId, fromId) {
+  const available = editingAvailable();
+  if (!available.ok) {
+    const err = new Error(available.reason);
+    err.code = "unavailable";
+    throw err;
+  }
+  if (!hasPassphrase()) {
+    const err = new Error("Confirm the dashboard password to merge these records.");
+    err.code = "auth";
+    throw err;
+  }
+  return callProxy(`/manuscripts/${encodeURIComponent(keepId)}/merge`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ from: fromId }),
+  });
+}
+
+/**
+ * Remove a manuscript from the tracker.
+ *
+ * This deletes the RECORD, not the emails behind it. Those message ids stay in
+ * the sync's ledger, so the mail already read will not rebuild it -- but a new
+ * email about the same paper will file it again from scratch. The confirmation
+ * step says so, because a card quietly reappearing is worse than one that
+ * never went away.
+ *
+ * The commit stays in the repository's history either way, so nothing here is
+ * unrecoverable by someone with the log.
+ */
+export async function deleteManuscript(id) {
+  const available = editingAvailable();
+  if (!available.ok) {
+    const err = new Error(available.reason);
+    err.code = "unavailable";
+    throw err;
+  }
+  if (!hasPassphrase()) {
+    const err = new Error("Confirm the dashboard password to delete this manuscript.");
+    err.code = "auth";
+    throw err;
+  }
+  return callProxy(`/manuscripts/${encodeURIComponent(id)}`, { method: "DELETE" });
 }
 
 /**

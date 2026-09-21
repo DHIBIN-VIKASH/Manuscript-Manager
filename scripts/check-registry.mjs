@@ -4,7 +4,9 @@
  *
  *   node scripts/check-registry.mjs
  */
-import { applyEvent, applyEdit, isPinned } from "./lib/registry.mjs";
+import { applyEvent, applyEdit, isPinned, titleSimilarity, baseManuscriptNumber,
+  isPlausibleManuscriptNumber, tombstoneFor, silence, isPublisherName } from "./lib/registry.mjs";
+import { ourAddresses, isFromOurselves, addressOf } from "./lib/ourselves.mjs";
 
 const reg = { manuscripts: [] };
 const ev = (o) => ({ revisionRound: null, doi: null, publicationLink: null, summary: "", needsReview: false, ...o });
@@ -87,7 +89,7 @@ const m6 = reg6.manuscripts[0];
 
 applyEdit(m6, { bucket: "in_review" });
 check("an edit moves the card", m6.bucket === "in_review");
-check("and records the previous value", m6.edits[0].changes[0].from === "submissions");
+check("and records the previous value", m6.edits[0].changes[0].from === "in_review");
 
 // The event that would have moved it back.
 applyEvent(reg6, ev({ title: "Pinned Paper", journal: "Journal D", eventType: "rejected", timestamp: "2026-08-05T00:00:00Z", source: { messageId: "p2" } }));
@@ -345,6 +347,304 @@ const chainError = async (providers) => {
 
   const bad = await statusOf(400, '{"message":"malformed request"}');
   check("400 stays the email's problem", bad?.deferrable === false);
+}
+
+// --- the sync window must not walk backwards ---------------------------------
+//
+// The rule the sync applies, extracted so it can be exercised without Gmail:
+// the overlap is a safety margin on a window that FINISHED. Applied to a
+// window being held open because work remains, it compounds -- each run
+// subtracts another two days from a point already rewound, and the mailbox
+// slides into the past. One did: 8 August to 5 August in a day, three times
+// faster once the schedule went hourly.
+const OVERLAP_DAYS = 2, DAY = 86400000;
+const sinceFor = (state) =>
+  new Date(new Date(state.lastSyncedAt).getTime() - (state.holding ? 0 : OVERLAP_DAYS * DAY));
+
+{
+  // A finished window still gets its overlap: that is what catches an email
+  // that landed at the boundary while the last run was mid-flight.
+  const clean = { lastSyncedAt: "2026-08-20T00:00:00.000Z", holding: false };
+  const back = (new Date(clean.lastSyncedAt) - sinceFor(clean)) / DAY;
+  check("a completed window still re-scans the overlap", back === OVERLAP_DAYS);
+}
+
+{
+  const held = { lastSyncedAt: "2026-08-20T00:00:00.000Z", holding: true };
+  check(
+    "a held window is not rewound again",
+    sinceFor(held).toISOString() === held.lastSyncedAt
+  );
+}
+
+{
+  // The regression itself: hold the window ten runs in a row, each time at the
+  // oldest thing still outstanding, and the start must not creep backwards.
+  let state = { lastSyncedAt: "2026-08-20T00:00:00.000Z", holding: true };
+  const first = sinceFor(state).getTime();
+  for (let run = 0; run < 10; run++) {
+    const since = sinceFor(state);
+    // Worst case: the oldest undecided message sits right at the window start.
+    state = { lastSyncedAt: since.toISOString(), holding: true };
+  }
+  check("ten held runs do not walk the window into the past", sinceFor(state).getTime() === first);
+}
+
+{
+  // And the same loop under the old rule, to show the check has teeth.
+  const oldRule = (st) => new Date(new Date(st.lastSyncedAt).getTime() - OVERLAP_DAYS * DAY);
+  let st = { lastSyncedAt: "2026-08-20T00:00:00.000Z" };
+  for (let run = 0; run < 10; run++) st = { lastSyncedAt: oldRule(st).toISOString() };
+  const drift = (Date.parse("2026-08-20T00:00:00.000Z") - Date.parse(st.lastSyncedAt)) / DAY;
+  check("the old rule really did drift, 2 days per run", drift === 20);
+}
+
+// --- revisions get their own section -----------------------------------------
+//
+// "In review" means the journal is working on it. A revision request means YOU
+// are, and the two sat in one pile -- so a paper waiting on your revision read
+// as a paper you could forget about.
+{
+  const reg = { manuscripts: [] };
+  applyEvent(reg, ev({ title: "Needs A Revision", journal: "Journal R", eventType: "new_submission", timestamp: "2026-08-01T00:00:00Z", source: { messageId: "rv1" } }));
+  applyEvent(reg, ev({ title: "Needs A Revision", journal: "Journal R", eventType: "revision_requested", timestamp: "2026-08-10T00:00:00Z", source: { messageId: "rv2" } }));
+  check("a revision request lands in its own section", reg.manuscripts[0].bucket === "revisions_pending");
+
+  // And the states around it must not have moved with it.
+  const under = { manuscripts: [] };
+  applyEvent(under, ev({ title: "Just Under Review", journal: "Journal S", eventType: "under_review", timestamp: "2026-08-10T00:00:00Z", source: { messageId: "ur1" } }));
+  check("under review is still in review", under.manuscripts[0].bucket === "in_review");
+
+  const acc = { manuscripts: [] };
+  applyEvent(acc, ev({ title: "Accepted Paper", journal: "Journal T", eventType: "accepted", timestamp: "2026-08-10T00:00:00Z", source: { messageId: "ac1" } }));
+  check("accepted is still in review", acc.manuscripts[0].bucket === "in_review");
+
+  const back = { manuscripts: [] };
+  applyEvent(back, ev({ title: "Sent Back Paper", journal: "Journal U", eventType: "sent_back", timestamp: "2026-08-10T00:00:00Z", source: { messageId: "sb1" } }));
+  check("sent back is still needs action", back.manuscripts[0].bucket === "needs_action");
+
+  // Moving on clears it again, so a finished revision does not linger.
+  applyEvent(reg, ev({ title: "Needs A Revision", journal: "Journal R", eventType: "under_review", timestamp: "2026-08-20T00:00:00Z", source: { messageId: "rv3" } }));
+  check("and it leaves the section once the journal takes it back", reg.manuscripts[0].bucket === "in_review");
+}
+
+// --- two papers that read alike stay two papers ------------------------------
+//
+// These are real titles, from two real studies. Character-bigram Dice scores
+// them 0.835, over the 0.82 the matcher used to merge on, so one record
+// swallowed the other's rejection and a rejected paper showed no sign of ever
+// having been submitted. Nothing in the wording says they are the same work,
+// so nothing in the code may decide that they are.
+{
+  const first =
+    "How Does Pelvic Fixation Fail in Adult Spinal Deformity? A Construct-Stratified Systematic Review and Meta-Analysis";
+  const second =
+    "How Often Does Pelvic Fixation Fail After Adult Spinal Deformity Surgery? A Systematic Review and Proportional Meta-Analysis";
+  check("the two titles really are close enough to have merged", titleSimilarity(first, second) >= 0.82);
+
+  const reg = { manuscripts: [] };
+  applyEvent(reg, ev({ title: first, journal: "Global Spine Journal", manuscriptNumber: "GSJ-26-1654", eventType: "new_submission", timestamp: "2026-08-16T00:00:00Z", source: { messageId: "pf1" } }));
+  applyEvent(reg, ev({ title: second, journal: "Global Spine Journal", manuscriptNumber: "GSJ-26-1720", eventType: "new_submission", timestamp: "2026-08-25T00:00:00Z", source: { messageId: "pf2" } }));
+
+  check("a near-identical title opens its own record", reg.manuscripts.length === 2);
+  check("and each keeps its own manuscript number", reg.manuscripts.map((m) => m.currentManuscriptNumber).join() === "GSJ-26-1654,GSJ-26-1720");
+
+  // Separating them is the safe default, not the certain answer, so the second
+  // record has to say what it was nearly filed under.
+  const opened = reg.manuscripts[1];
+  check("and asks a human to confirm they differ", opened.needsReview === true);
+  check("and names the paper it resembles", (opened.reviewReason || "").includes(first));
+
+  // The rejection that went missing: it must land on the paper it names.
+  applyEvent(reg, ev({ title: first, journal: "Global Spine Journal", manuscriptNumber: "GSJ-26-1654", eventType: "rejected", timestamp: "2026-08-21T00:00:00Z", source: { messageId: "pf3" } }));
+  check("and a rejection files against its own paper", reg.manuscripts[0].bucket === "needs_action");
+  check("and leaves the other alone", reg.manuscripts[1].bucket === "in_review");
+}
+
+// --- an exact title still matches, however it is punctuated ------------------
+//
+// The bar is an exact title, not an identical string: journals re-typeset what
+// they were given. Normalisation absorbs that, so no alias is needed and none
+// is invented -- a rename is something a person records, by hand.
+{
+  const reg = { manuscripts: [] };
+  applyEvent(reg, ev({ title: "Sclerostin Inhibition & Bone Anabolism: A Review", journal: "Journal T", eventType: "new_submission", timestamp: "2026-08-16T00:00:00Z", source: { messageId: "tx1" } }));
+  applyEvent(reg, ev({ title: "Sclerostin inhibition and bone anabolism - a review", journal: "Journal T", eventType: "under_review", timestamp: "2026-08-20T00:00:00Z", source: { messageId: "tx2" } }));
+
+  check("punctuation and case do not split a record", reg.manuscripts.length === 1);
+  check("and no alias is invented for it", (reg.manuscripts[0].titleAliases || []).length === 0);
+  check("and the flag is not raised on an exact match", reg.manuscripts[0].needsReview === false);
+}
+
+// --- a title far from everything opens quietly -------------------------------
+{
+  const reg = { manuscripts: [] };
+  applyEvent(reg, ev({ title: "Rotator Cuff Repair in Diabetics", journal: "Journal U", eventType: "new_submission", timestamp: "2026-08-16T00:00:00Z", source: { messageId: "fa1" } }));
+  applyEvent(reg, ev({ title: "Bone Cement Leakage After Vertebroplasty", journal: "Journal U", eventType: "new_submission", timestamp: "2026-08-17T00:00:00Z", source: { messageId: "fa2" } }));
+
+  check("an unrelated title opens a record without a flag", reg.manuscripts.length === 2 && reg.manuscripts[1].needsReview === false);
+}
+
+// --- a hand-set alias is still a matching key --------------------------------
+//
+// The one way a rename gets recorded now, so it has to keep working.
+{
+  const reg = { manuscripts: [] };
+  applyEvent(reg, ev({ title: "Old Name For A Paper", journal: "Journal V", eventType: "new_submission", timestamp: "2026-08-16T00:00:00Z", source: { messageId: "al1" } }));
+  applyEdit(reg.manuscripts[0], { title: "New Name For A Paper" });
+  applyEvent(reg, ev({ title: "Old Name For A Paper", journal: "Journal V", eventType: "under_review", timestamp: "2026-08-20T00:00:00Z", source: { messageId: "al2" } }));
+
+  check("an edit records the previous title", (reg.manuscripts[0].titleAliases || []).includes("Old Name For A Paper"));
+  check("and the old title keeps matching", reg.manuscripts.length === 1);
+}
+
+// --- a revision round is the same paper --------------------------------------
+//
+// JOA-D-26-01135R1 and JOA-D-26-01135R4 are one submission on its first and
+// fourth revision. Compared literally they were two, and the registry duly
+// carried two records for one paper -- the revision emails, the ones bearing
+// deadlines, landing on the half with no history.
+{
+  check("the round is not part of the number", baseManuscriptNumber("JOA-D-26-01135R4") === "joa-d-26-01135");
+  check("however the journal punctuates it", baseManuscriptNumber("GSJ-26-0695.R1") === "gsj-26-0695");
+  check("and a number without one is unchanged", baseManuscriptNumber("GSJ-26-1654") === "gsj-26-1654");
+
+  const reg = { manuscripts: [] };
+  applyEvent(reg, ev({ title: "A Paper Under Revision", journal: "The Journal of Arthroplasty", manuscriptNumber: "JOA-D-26-01135R1", eventType: "new_submission", timestamp: "2026-08-01T00:00:00Z", source: { messageId: "jr1" } }));
+  applyEvent(reg, ev({ title: "A Completely Different Wording The Journal Used", journal: "The Journal of Arthroplasty", manuscriptNumber: "JOA-D-26-01135R4", eventType: "revision_requested", timestamp: "2026-09-01T00:00:00Z", source: { messageId: "jr2" } }));
+  check("a later round lands on the same record", reg.manuscripts.length === 1);
+  check("and brings its event with it", reg.manuscripts[0].timeline.length === 2);
+
+  // But a different paper at the same journal must still be its own record.
+  applyEvent(reg, ev({ title: "An Unrelated Paper Entirely", journal: "The Journal of Arthroplasty", manuscriptNumber: "JOA-D-26-09999", eventType: "new_submission", timestamp: "2026-09-02T00:00:00Z", source: { messageId: "jr3" } }));
+  check("a different number is still a different paper", reg.manuscripts.length === 2);
+}
+
+// --- not everything shaped like an id is a manuscript number -----------------
+//
+// This registry has a paper whose number is "EMID:8291c19a770456c2", read out
+// of a mail footer. A wrong number is worse than none: it is what the next
+// email matches on.
+{
+  for (const good of ["JOA-D-26-01135R4", "GSJ-26-0695.R1", "127479", "JBJSOA-D-26-00274"]) {
+    check(`"${good}" is a manuscript number`, isPlausibleManuscriptNumber(good));
+  }
+  for (const junk of ["EMID:8291c19a770456c2", "10.1007/978-1-0716-5614-3_10", "", "a b c", "no-digits-here"]) {
+    check(`"${junk}" is not`, !isPlausibleManuscriptNumber(junk));
+  }
+
+  const reg = { manuscripts: [] };
+  applyEvent(reg, ev({ title: "First Paper With A Junk Number", journal: "Journal X", manuscriptNumber: "EMID:8291c19a770456c2", eventType: "new_submission", timestamp: "2026-08-01T00:00:00Z", source: { messageId: "e1" } }));
+  applyEvent(reg, ev({ title: "Second Paper With The Same Junk Number", journal: "Journal X", manuscriptNumber: "EMID:8291c19a770456c2", eventType: "new_submission", timestamp: "2026-08-02T00:00:00Z", source: { messageId: "e2" } }));
+  check("a junk id does not merge two papers", reg.manuscripts.length === 2);
+}
+
+// --- a delete has to hold ----------------------------------------------------
+//
+// Deleting removed the record but not the mail, so the next email rebuilt it.
+// One paper here was deleted on 10 September, returned, and deleted again on
+// the 12th.
+{
+  const reg = { manuscripts: [] };
+  applyEvent(reg, ev({ title: "A Paper Somebody Deleted", journal: "Journal Y", manuscriptNumber: "JY-26-001", eventType: "new_submission", timestamp: "2026-08-01T00:00:00Z", source: { messageId: "t1" } }));
+  const doomed = reg.manuscripts[0];
+
+  reg.tombstones = [tombstoneFor(doomed, "2026-09-01T00:00:00Z")];
+  reg.manuscripts = [];
+
+  const again = applyEvent(reg, ev({ title: "A Paper Somebody Deleted", journal: "Journal Y", manuscriptNumber: "JY-26-001", eventType: "rejected", timestamp: "2026-09-02T00:00:00Z", source: { messageId: "t2" } }));
+  check("a later email does not rebuild a deleted paper", reg.manuscripts.length === 0);
+  check("and the caller is told it was refused", again === null);
+
+  // A revision of the deleted submission is the same paper, so also suppressed.
+  applyEvent(reg, ev({ title: "Retitled By The Journal Meanwhile", journal: "Journal Y", manuscriptNumber: "JY-26-001R2", eventType: "revision_requested", timestamp: "2026-09-03T00:00:00Z", source: { messageId: "t3" } }));
+  check("nor by a later round of the same submission", reg.manuscripts.length === 0);
+
+  // But it is not a ban on the subject: a genuinely new submission files.
+  applyEvent(reg, ev({ title: "A Brand New Paper About Something Else", journal: "Journal Y", manuscriptNumber: "JY-26-777", eventType: "new_submission", timestamp: "2026-09-04T00:00:00Z", source: { messageId: "t4" } }));
+  check("a different paper still files normally", reg.manuscripts.length === 1);
+}
+
+// --- silence is itself information -------------------------------------------
+{
+  const now = Date.parse("2026-09-13T00:00:00Z");
+  const at = (bucket, daysAgo) => ({ bucket, updatedAt: new Date(now - daysAgo * 86400000).toISOString() });
+
+  check("a fresh submission is not stale", silence(at("in_review", 10), now).stale === false);
+  check("a submission silent for six months is", silence(at("in_review", 180), now).stale === true);
+  check("and it says how long", silence(at("in_review", 180), now).days === 180);
+  check("a revision owed for six weeks is stale sooner", silence(at("revisions_pending", 45), now).stale === true);
+  check("but not at a fortnight", silence(at("revisions_pending", 14), now).stale === false);
+  check("a published paper is never stale", silence(at("published", 900), now).stale === false);
+  check("a record with no date says nothing", silence({ bucket: "in_review" }, now) === null);
+}
+
+// --- a rejection closes a submission, not the paper -------------------------
+//
+// "Is Three-Level Hybrid Cervical Surgery as Safe as Three-Level ACDF" went to
+// JBJS Open Access on 3 September and was rejected by Archives of Orthopaedic
+// and Trauma Surgery on the 5th. The rejection, being newest, moved the card to
+// "needs action" as though a new home were wanted. It was already in one.
+{
+  const reg = { manuscripts: [] };
+  applyEvent(reg, ev({ title: "A Paper At Two Journals", journal: "Journal A", manuscriptNumber: "A-1", eventType: "new_submission", timestamp: "2026-08-01T00:00:00Z", source: { messageId: "x1" } }));
+  applyEvent(reg, ev({ title: "A Paper At Two Journals", journal: "Journal B", manuscriptNumber: "B-1", eventType: "new_submission", timestamp: "2026-09-03T00:00:00Z", source: { messageId: "x2" } }));
+  applyEvent(reg, ev({ title: "A Paper At Two Journals", journal: "Journal A", manuscriptNumber: "A-1", eventType: "rejected", timestamp: "2026-09-05T00:00:00Z", source: { messageId: "x3" } }));
+
+  const m = reg.manuscripts[0];
+  check("a rejection at one journal does not ask for action while another is live", m.bucket === "in_review");
+  check("and the rejection is still on the record", m.timeline.some((t) => t.eventType === "rejected"));
+
+  // But when nothing is left, it does need a new home.
+  applyEvent(reg, ev({ title: "A Paper At Two Journals", journal: "Journal B", manuscriptNumber: "B-1", eventType: "rejected", timestamp: "2026-09-06T00:00:00Z", source: { messageId: "x4" } }));
+  check("and once the last one goes, it asks", m.bucket === "needs_action");
+}
+
+// --- submitted and under review are one section -----------------------------
+{
+  const reg = { manuscripts: [] };
+  applyEvent(reg, ev({ title: "Freshly Submitted Paper", journal: "Journal C", eventType: "new_submission", timestamp: "2026-09-01T00:00:00Z", source: { messageId: "s1" } }));
+  check("a new submission sits with the journal", reg.manuscripts[0].bucket === "in_review");
+  applyEvent(reg, ev({ title: "Freshly Submitted Paper", journal: "Journal C", eventType: "under_review", timestamp: "2026-09-02T00:00:00Z", source: { messageId: "s2" } }));
+  check("and going under review does not move it", reg.manuscripts[0].bucket === "in_review");
+}
+
+// --- a publisher is not a journal -------------------------------------------
+{
+  check("Springer Nature is a publisher", isPublisherName("Springer Nature"));
+  check("and so is Wolters Kluwer", isPublisherName("wolters kluwer"));
+  // A named list, not a pattern: these are real journals named after houses.
+  for (const journal of ["Frontiers in Surgery", "BMC Public Health", "Nature Medicine", "European Spine Journal"]) {
+    check(`"${journal}" is a journal`, !isPublisherName(journal));
+  }
+
+  const reg = { manuscripts: [] };
+  applyEvent(reg, ev({ title: "A Paper Springer Signed For", journal: "European Spine Journal", eventType: "new_submission", timestamp: "2026-08-01T00:00:00Z", source: { messageId: "p1" } }));
+  applyEvent(reg, ev({ title: "A Paper Springer Signed For", journal: "Springer Nature", eventType: "under_review", timestamp: "2026-09-01T00:00:00Z", source: { messageId: "p2" } }));
+  const m = reg.manuscripts[0];
+  check("a publisher does not overwrite the journal a paper is with", m.currentJournal === "European Spine Journal");
+  check("and the record says the name was wrong", m.needsReview === true && /publisher/i.test(m.reviewReason || ""));
+}
+
+// --- the group forwarding to itself -----------------------------------------
+//
+// A forward arrives dated today, not when the journal wrote, so a rejection
+// passed on weeks later becomes the newest thing known about a paper.
+{
+  const ours = ourAddresses(
+    [{ email: "drsathishmuthu@gmail.com" }, { email: "dhibinvikash1@gmail.com" }],
+    ["dhibinvikash@outlook.com"]
+  );
+  check("one of us forwarding is ours", isFromOurselves("Dr Sathish Muthu <drsathishmuthu@gmail.com>", ours));
+  check("however the address is capitalised", isFromOurselves("<DHIbinvikash@outlook.com>", ours));
+
+  // Narrow on purpose: journals and editors write from personal addresses too,
+  // and this registry has real events from both.
+  check("a journal on gmail still files", !isFromOurselves("journalofarthroplasty@gmail.com", ours));
+  check("and an editor writing personally still files", !isFromOurselves("louie.philip@gmail.com", ours));
+  check("and a journal's own system files", !isFromOurselves("Global Spine Journal <onbehalfof@manuscriptcentral.com>", ours));
+  check("a From with no address is not ours", !isFromOurselves("Editorial Office", ours));
+  check("an address is read out of a display name", addressOf("Dr Sathish Muthu <drsathishmuthu@gmail.com>") === "drsathishmuthu@gmail.com");
 }
 
 console.log(failures ? `\n${failures} registry check(s) failed.` : "\nAll registry checks passed.");

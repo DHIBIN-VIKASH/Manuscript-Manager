@@ -15,7 +15,7 @@
  *
  *   node scripts/check-worker.mjs
  */
-import worker from "../worker/src/index.js";
+import worker, { __resetBranchCache } from "../worker/src/index.js";
 import { applyEdit as applyEditInSync, OVERRIDABLE } from "./lib/registry.mjs";
 
 const PASSWORD = "test-password";
@@ -58,17 +58,37 @@ const fromB64 = (text) => Buffer.from(text, "base64").toString("utf8");
  * on each attempt — "conflict" makes GitHub reject the blob SHA the way it does
  * when the sync has committed in between.
  */
-function stubGitHub({ registry, sha = "sha-1", plan = [] } = {}) {
+function stubGitHub({ registry, sha = "sha-1", plan = [], defaultBranch = "main", dispatch = "ok", read = "ok" } = {}) {
   const calls = [];
   let current = registry;
   let currentSha = sha;
   let attempt = 0;
 
+  __resetBranchCache();
+
   globalThis.fetch = async (url, options = {}) => {
     const path = new URL(url).pathname;
     calls.push({ path, method: options.method || "GET", options });
 
+    // The repository itself, which is where the branch to act on comes from.
+    if (/\/repos\/[^/]+\/[^/]+$/.test(path)) {
+      return new Response(JSON.stringify({ default_branch: defaultBranch }), { status: 200 });
+    }
+
+    if (path.endsWith("/dispatches") && options.method === "POST") {
+      if (dispatch === "no-ref") {
+        return new Response(
+          JSON.stringify({ message: `No ref found for: ${JSON.parse(options.body).ref}` }),
+          { status: 422 }
+        );
+      }
+      return new Response(null, { status: 204 });
+    }
+
     if (path.endsWith("/contents/data/manuscripts.json") && (options.method || "GET") === "GET") {
+      if (read === "missing") {
+        return new Response(JSON.stringify({ message: "Not Found" }), { status: 404 });
+      }
       return new Response(JSON.stringify({ content: b64(JSON.stringify(current)), sha: currentSha }), {
         status: 200,
       });
@@ -111,7 +131,70 @@ function patchRequest(id, patch, { password = PASSWORD } = {}) {
   });
 }
 
+function deleteRequest(id, { password = PASSWORD } = {}) {
+  return new Request(`https://proxy.test/manuscripts/${id}`, {
+    method: "DELETE",
+    headers: { Authorization: `Bearer ${password}` },
+  });
+}
+
 const call = (request, e = env) => worker.fetch(request, e);
+
+await check("a missing data file blames the deployment, not the manuscript", async () => {
+  // What a stale Worker actually produces: it asks for a branch that has been
+  // deleted, so reading the data file 404s. Passed through raw that is
+  // `GitHub 404: {"message":"Not Found"}`, which reads as a broken app rather
+  // than a build that needs redeploying.
+  stubGitHub({ registry: registryWith({}), read: "missing" });
+  const res = await call(patchRequest("m1", { title: "A Corrected Title" }));
+  const body = await res.json();
+  assert(!/^GitHub 404/.test(body.error), `raw GitHub JSON reached the caller: ${body.error}`);
+  assert(/redeploy/i.test(body.error), `does not say what to do: ${body.error}`);
+  assert(/branch/i.test(body.error), `does not name the likely cause: ${body.error}`);
+});
+
+// --- which branch the Worker acts on ----------------------------------------
+//
+// This was a constant. The Worker deploys separately from the repository, so a
+// branch rename left the live Worker asking for a branch that no longer
+// existed, and Sync answered "No ref found for claude/manuscript-tracking-app-
+// jhj4p7" -- which reads as a broken button rather than a stale deployment.
+
+await check("sync dispatches on the repository's default branch, not a constant", async () => {
+  const gh = stubGitHub({ registry: registryWith({}), defaultBranch: "production" });
+  const res = await call(new Request("https://proxy.test/sync", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${PASSWORD}` },
+  }));
+  const dispatched = gh.calls.find((c) => c.path.endsWith("/dispatches"));
+  assert(dispatched, "no dispatch was made");
+  const ref = JSON.parse(dispatched.options.body).ref;
+  assert(ref === "production", `dispatched on "${ref}", not the repo's default branch`);
+  assert(res.status === 200 || res.status === 502, `unexpected status ${res.status}`);
+});
+
+await check("an edit writes to that same branch", async () => {
+  const gh = stubGitHub({ registry: registryWith({}), defaultBranch: "production" });
+  await call(patchRequest("m1", { title: "A Corrected Title" }));
+  const write = gh.calls.find((c) => c.method === "PUT" && c.path.includes("/contents/"));
+  assert(write, "no write was made");
+  const branch = JSON.parse(write.options.body).branch;
+  assert(branch === "production", `edit wrote to "${branch}", not the repo's default branch`);
+  const read = gh.calls.find((c) => c.method === "GET" && c.path.includes("/contents/"));
+  assert(read, "no read was made");
+});
+
+await check("a missing branch says the Worker is stale, not that sync is broken", async () => {
+  stubGitHub({ registry: registryWith({}), defaultBranch: "gone-away", dispatch: "no-ref" });
+  const res = await call(new Request("https://proxy.test/sync", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${PASSWORD}` },
+  }));
+  const body = await res.json();
+  assert(res.status === 502, `expected 502, got ${res.status}`);
+  assert(/gone-away/.test(body.error), `does not name the branch: ${body.error}`);
+  assert(/redeploy/i.test(body.error), `does not say what to do: ${body.error}`);
+});
 
 // --- the password gate ------------------------------------------------------
 
@@ -133,12 +216,14 @@ await check("a wrong password is refused", async () => {
 await check("no response body ever contains the GitHub token", async () => {
   const paths = ["/health", "/manuscripts/m1", "/sync", "/sync/12345", "/nope"];
   for (const path of paths) {
-    for (const method of ["GET", "POST", "PATCH"]) {
+    for (const method of ["GET", "POST", "PATCH", "DELETE"]) {
       stubGitHub({ registry: registryWith({}) });
       const res = await call(new Request(`https://proxy.test${path}`, {
         method,
         headers: { Authorization: `Bearer ${PASSWORD}` },
-        ...(method === "GET" ? {} : { body: JSON.stringify({ bucket: "in_review" }) }),
+        ...(method === "GET" || method === "DELETE"
+          ? {}
+          : { body: JSON.stringify({ bucket: "in_review" }) }),
       }));
       const text = await res.text();
       assert(!text.includes(TOKEN), `${method} ${path} leaked the token`);
@@ -371,6 +456,151 @@ await check("health reports a missing secret by name", async () => {
   assert(body.missing.includes("GITHUB_TOKEN"), `missing is ${JSON.stringify(body.missing)}`);
 });
 
+await check("/health says what the deployed build can do", async () => {
+  // The one question a browser can ask without a password: is what is running
+  // current? A Worker is deployed separately from this repository, and a stale
+  // one refuses new methods at CORS -- which a browser reports the same way as
+  // a Worker that was never deployed.
+  stubGitHub({ registry: registryWith({}) });
+  const res = await call(new Request("https://proxy.test/health"));
+  const body = await res.json();
+  assert(Array.isArray(body.methods), `methods is ${JSON.stringify(body.methods)}`);
+  for (const m of ["PATCH", "DELETE"]) {
+    assert(body.methods.includes(m), `/health does not admit to ${m}`);
+  }
+  // And it must agree with what CORS actually permits, or it is worse than
+  // saying nothing.
+  const preflight = await call(new Request("https://proxy.test/manuscripts/m1", {
+    method: "OPTIONS",
+    headers: { Origin: "https://org-karur-datacenter.github.io" },
+  }));
+  const allowed = preflight.headers.get("Access-Control-Allow-Methods") || "";
+  for (const m of body.methods) {
+    assert(allowed.includes(m), `/health claims ${m} but CORS does not allow it`);
+  }
+});
+
+// --- merging two records into one -------------------------------------------
+
+function mergeRequest(keepId, fromId, { password = PASSWORD } = {}) {
+  return new Request(`https://proxy.test/manuscripts/${keepId}/merge`, {
+    method: "POST",
+    headers: { Authorization: `Bearer ${password}`, "Content-Type": "application/json" },
+    body: JSON.stringify({ from: fromId }),
+  });
+}
+
+await check("a merge keeps both histories under one record", async () => {
+  const gh = stubGitHub({
+    registry: registryWith(
+      {
+        id: "keep", title: "The Title To Keep",
+        submissions: [{ journal: "Journal A", manuscriptNumber: "A-1", submittedDate: "2026-01-01T00:00:00Z", statusHistory: [] }],
+        timeline: [{ timestamp: "2026-01-01T00:00:00Z", eventType: "new_submission", source: { messageId: "k1" } }],
+        authorAccounts: ["Sathish"],
+      },
+      {
+        id: "dupe", title: "The Same Paper Under Another Name",
+        submissions: [{ journal: "Journal B", manuscriptNumber: "B-2", submittedDate: "2026-02-01T00:00:00Z", statusHistory: [] }],
+        timeline: [{ timestamp: "2026-02-01T00:00:00Z", eventType: "rejected", source: { messageId: "d1" } }],
+        authorAccounts: ["Dhibin"],
+        doi: "10.1000/found-here",
+      }
+    ),
+  });
+
+  const res = await call(mergeRequest("keep", "dupe"));
+  assert(res.status === 200, `expected 200, got ${res.status}`);
+
+  const left = gh.written().manuscripts;
+  assert(left.length === 1 && left[0].id === "keep", `survivors: ${JSON.stringify(left.map((m) => m.id))}`);
+  assert(left[0].timeline.length === 2, `timeline has ${left[0].timeline.length} entries, expected 2`);
+  assert(left[0].submissions.length === 2, `submissions: ${left[0].submissions.length}`);
+  assert(left[0].title === "The Title To Keep", "the surviving record lost its own title");
+  assert((left[0].titleAliases || []).includes("The Same Paper Under Another Name"),
+    "the other title was not kept as an alias, so later email will split them again");
+  assert(left[0].authorAccounts.includes("Dhibin"), "an author was lost in the merge");
+  assert(left[0].doi === "10.1000/found-here", "a fact only the merged record had was dropped");
+});
+
+await check("and does not duplicate an event both records had", async () => {
+  // The usual reason a paper splits: the same notice reached both halves.
+  const gh = stubGitHub({
+    registry: registryWith(
+      { id: "keep", timeline: [{ timestamp: "2026-01-01T00:00:00Z", eventType: "new_submission", source: { messageId: "shared" } }] },
+      { id: "dupe", timeline: [{ timestamp: "2026-01-01T00:00:00Z", eventType: "new_submission", source: { messageId: "shared" } }] }
+    ),
+  });
+  await call(mergeRequest("keep", "dupe"));
+  assert(gh.written().manuscripts[0].timeline.length === 1, "the shared event was filed twice");
+});
+
+await check("a merge leaves no tombstone, because the paper is not gone", async () => {
+  const gh = stubGitHub({ registry: registryWith({ id: "keep" }, { id: "dupe" }) });
+  await call(mergeRequest("keep", "dupe"));
+  assert(!(gh.written().tombstones || []).length, "merging away a record suppressed it as if deleted");
+});
+
+await check("a manuscript cannot be merged into itself", async () => {
+  stubGitHub({ registry: registryWith({ id: "keep" }) });
+  const res = await call(mergeRequest("keep", "keep"));
+  assert(res.status === 400, `expected 400, got ${res.status}`);
+});
+
+await check("a merge without the password is refused", async () => {
+  const gh = stubGitHub({ registry: registryWith({ id: "keep" }, { id: "dupe" }) });
+  const res = await call(new Request("https://proxy.test/manuscripts/keep/merge", {
+    method: "POST", body: JSON.stringify({ from: "dupe" }),
+  }));
+  assert(res.status === 401, `expected 401, got ${res.status}`);
+  assert(!gh.calls.some((c) => c.method === "PUT"), "an unauthenticated merge still wrote");
+});
+
+// --- a delete must leave something behind ------------------------------------
+
+await check("deleting records a tombstone so the paper cannot rebuild itself", async () => {
+  const gh = stubGitHub({
+    registry: registryWith({
+      id: "m1", title: "A Paper About Knees",
+      submissions: [{ journal: "Journal A", manuscriptNumber: "JOA-D-26-01135R4", submittedDate: "2026-01-01T00:00:00Z", statusHistory: [] }],
+    }),
+  });
+  await call(deleteRequest("m1"));
+  const stones = gh.written().tombstones || [];
+  assert(stones.length === 1, `expected 1 tombstone, got ${stones.length}`);
+  assert(stones[0].id === "m1", `tombstone names ${stones[0].id}`);
+  // Stored with the revision round stripped, exactly as registry.mjs matches.
+  assert(stones[0].numbers.includes("joa-d-26-01135"),
+    `numbers are ${JSON.stringify(stones[0].numbers)} — a later round would slip past`);
+  assert(stones[0].titleNormalized === "a paper about knees",
+    `titleNormalized is ${JSON.stringify(stones[0].titleNormalized)}`);
+});
+
+await check("the Worker and the sync agree on what a tombstone looks like", async () => {
+  // The Worker cannot import from registry.mjs, so the rule is written twice.
+  // This is the check that the copies have not drifted.
+  const { tombstoneFor, isTombstoned } = await import("./lib/registry.mjs");
+  const manuscript = {
+    id: "m1", title: "A Paper About Knees", currentJournal: "Journal A",
+    submissions: [{ journal: "Journal A", manuscriptNumber: "JOA-D-26-01135R4" }],
+  };
+  const gh = stubGitHub({
+    registry: registryWith({
+      id: "m1", title: "A Paper About Knees",
+      submissions: [{ journal: "Journal A", manuscriptNumber: "JOA-D-26-01135R4", submittedDate: "2026-01-01T00:00:00Z", statusHistory: [] }],
+    }),
+  });
+  await call(deleteRequest("m1"));
+  const fromWorker = (gh.written().tombstones || [])[0];
+  const fromSync = tombstoneFor(manuscript, fromWorker.deletedAt);
+  assert(JSON.stringify(fromWorker) === JSON.stringify(fromSync),
+    `the two differ:\n      worker: ${JSON.stringify(fromWorker)}\n      sync:   ${JSON.stringify(fromSync)}`);
+  // And the sync must actually honour what the Worker wrote.
+  assert(isTombstoned({ tombstones: [fromWorker] },
+    { title: "A Paper About Knees", manuscriptNumber: "JOA-D-26-01135R9", journal: "Journal A" }),
+    "the sync does not recognise the Worker's own tombstone");
+});
+
 await check("a browser preflight is answered", async () => {
   stubGitHub({ registry: registryWith({}) });
   const res = await call(new Request("https://proxy.test/manuscripts/m1", {
@@ -378,8 +608,9 @@ await check("a browser preflight is answered", async () => {
     headers: { Origin: "https://org-karur-datacenter.github.io" },
   }));
   assert(res.status === 204, `expected 204, got ${res.status}`);
-  assert(/PATCH/.test(res.headers.get("Access-Control-Allow-Methods") || ""),
-    "PATCH is not allowed, so the browser will block every edit");
+  const allowed = res.headers.get("Access-Control-Allow-Methods") || "";
+  assert(/PATCH/.test(allowed), "PATCH is not allowed, so the browser will block every edit");
+  assert(/DELETE/.test(allowed), "DELETE is not allowed, so the browser will block every deletion");
 });
 
 await check("edits are written to the branch the dashboard reads", async () => {
@@ -387,6 +618,86 @@ await check("edits are written to the branch the dashboard reads", async () => {
   await call(patchRequest("m1", { bucket: "published" }));
   const put = gh.calls.find((c) => c.method === "PUT");
   assert(JSON.parse(put.options.body).branch === BRANCH, "the edit went to the wrong branch");
+});
+
+
+// --- deleting a manuscript --------------------------------------------------
+//
+// A delete has one property an edit does not: get it wrong and there is
+// nothing left on the page to notice it by. So it is checked for what it
+// removes AND for what it leaves.
+
+await check("a delete removes only the manuscript named", async () => {
+  const gh = stubGitHub({
+    registry: registryWith({ id: "m1" }, { id: "m2", title: "A Second Paper Left Alone" }),
+  });
+  const res = await call(deleteRequest("m1"));
+  assert(res.status === 200, `expected 200, got ${res.status}`);
+  const left = gh.written().manuscripts;
+  assert(left.length === 1, `expected 1 manuscript left, got ${left.length}`);
+  assert(left[0].id === "m2", `the wrong manuscript survived: ${left[0].id}`);
+});
+
+await check("and hands back what it removed", async () => {
+  stubGitHub({ registry: registryWith({ id: "m1", title: "A Paper About Knees" }) });
+  const body = await (await call(deleteRequest("m1"))).json();
+  assert(body.ok === true, "delete did not report success");
+  assert(body.deleted && body.deleted.id === "m1", `deleted is ${JSON.stringify(body.deleted)}`);
+});
+
+await check("and says in the commit what can no longer be seen on the page", async () => {
+  const gh = stubGitHub({
+    registry: registryWith({
+      id: "m1",
+      title: "A Paper About Knees",
+      currentManuscriptNumber: "JOIO-D-26-01625",
+      timeline: [{ eventType: "new_submission" }, { eventType: "rejected" }],
+    }),
+  });
+  await call(deleteRequest("m1"));
+  const message = JSON.parse(gh.calls.find((c) => c.method === "PUT").options.body).message;
+  assert(/^Delete "A Paper About Knees"/.test(message), `message was: ${message}`);
+  assert(message.includes("JOIO-D-26-01625"), "the manuscript number is not recoverable from history");
+  assert(/2/.test(message.split("timeline entries removed:")[1] || ""), "does not say how much history went");
+});
+
+await check("a delete losing the race to the sync is replayed, not dropped", async () => {
+  const gh = stubGitHub({
+    registry: registryWith({ id: "m1" }, { id: "m2" }),
+    plan: ["conflict", "ok"],
+  });
+  const res = await call(deleteRequest("m1"));
+  assert(res.status === 200, `expected 200, got ${res.status}`);
+  assert(gh.written().manuscripts.length === 1, "the retry did not delete anything");
+  const puts = gh.calls.filter((c) => c.method === "PUT");
+  assert(puts.length === 2, `expected 2 write attempts, got ${puts.length}`);
+});
+
+await check("deleting something already gone says so rather than half-succeeding", async () => {
+  stubGitHub({ registry: registryWith({ id: "m1" }) });
+  const res = await call(deleteRequest("m2"));
+  assert(res.status === 404, `expected 404, got ${res.status}`);
+});
+
+await check("a delete without the password is refused", async () => {
+  const gh = stubGitHub({ registry: registryWith({ id: "m1" }) });
+  const res = await call(new Request("https://proxy.test/manuscripts/m1", { method: "DELETE" }));
+  assert(res.status === 401, `expected 401, got ${res.status}`);
+  assert(!gh.calls.some((c) => c.method === "PUT"), "an unauthenticated delete still wrote");
+});
+
+await check("a wrong password cannot delete", async () => {
+  const gh = stubGitHub({ registry: registryWith({ id: "m1" }) });
+  const res = await call(deleteRequest("m1", { password: "wrong" }));
+  assert(res.status === 401, `expected 401, got ${res.status}`);
+  assert(!gh.calls.some((c) => c.method === "PUT"), "a wrong password still wrote");
+});
+
+await check("a delete goes to the branch the dashboard reads", async () => {
+  const gh = stubGitHub({ registry: registryWith({ id: "m1" }) });
+  await call(deleteRequest("m1"));
+  const put = gh.calls.find((c) => c.method === "PUT");
+  assert(JSON.parse(put.options.body).branch === BRANCH, "the delete went to the wrong branch");
 });
 
 // ---------------------------------------------------------------------------

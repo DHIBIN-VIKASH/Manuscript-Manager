@@ -1,40 +1,357 @@
 {
-  "sent": [],
+  "sent": [
+    {
+      "key": "national-and-subnational-burden-of-low-back-pain-in-india-1990-2023-a-|2026-08-19T18:29:59.999Z|t-3",
+      "kind": "superseded",
+      "manuscriptId": "national-and-subnational-burden-of-low-back-pain-in-india-1990-2023-a-",
+      "at": "2026-08-30T12:58:34.627Z"
+    },
+    {
+      "key": "national-and-subnational-burden-of-low-back-pain-in-india-1990-2023-a-|2026-08-19T18:29:59.999Z|t-1",
+      "kind": "superseded",
+      "manuscriptId": "national-and-subnational-burden-of-low-back-pain-in-india-1990-2023-a-",
+      "at": "2026-08-30T12:58:34.627Z"
+    },
+    {
+      "key": "national-and-subnational-burden-of-low-back-pain-in-india-1990-2023-a-|2026-08-19T18:29:59.999Z|overdue",
+      "kind": "superseded",
+      "manuscriptId": "national-and-subnational-burden-of-low-back-pain-in-india-1990-2023-a-",
+      "at": "2026-08-30T12:58:34.627Z"
+    },
+    {
+      "key": "national-and-subnational-burden-of-low-back-pain-in-india-1990-2023-a-|2026-08-19T18:29:59.999Z|new",
+      "kind": "new",
+      "manuscriptId": "national-and-subnational-burden-of-low-back-pain-in-india-1990-2023-a-",
+      "title": "National and subnational burden of low back pain in India, 1990–2023: a systematic analysis for the Global Burden of Disease Study 2023",
+      "due": "2026-08-19T18:29:59.999Z",
+      "at": "2026-08-30T12:58:34.627Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "broad-spectrum-in-vitro-antimicrobial-activity-of-homologous-platelet-|2026-09-01T18:29:59.999Z|t-3",
+      "kind": "superseded",
+      "manuscriptId": "broad-spectrum-in-vitro-antimicrobial-activity-of-homologous-platelet-",
+      "at": "2026-08-30T12:58:35.970Z"
+    },
+    {
+      "key": "broad-spectrum-in-vitro-antimicrobial-activity-of-homologous-platelet-|2026-09-01T18:29:59.999Z|new",
+      "kind": "new",
+      "manuscriptId": "broad-spectrum-in-vitro-antimicrobial-activity-of-homologous-platelet-",
+      "title": "Broad-Spectrum In-Vitro Antimicrobial Activity of Homologous Platelet Lysate Against Clinically Relevant Bacterial Pathogens: A Prospective Donor-Pool Study",
+      "due": "2026-09-01T18:29:59.999Z",
+      "at": "2026-08-30T12:58:35.970Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "is-morbid-obesity-a-risk-factor-or-simply-a-surgical-challenge-a-syste|2026-09-11T18:29:59.999Z|new",
+      "kind": "new",
+      "manuscriptId": "is-morbid-obesity-a-risk-factor-or-simply-a-surgical-challenge-a-syste",
+      "title": "Is Morbid Obesity a Risk Factor or Simply a Surgical Challenge? A Systematic Review and Meta-Analysis of Spine Surgery Outcomes",
+      "due": "2026-09-11T18:29:59.999Z",
+      "at": "2026-08-30T12:58:37.119Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "broad-spectrum-in-vitro-antimicrobial-activity-of-homologous-platelet-|2026-09-01T18:29:59.999Z|t-1",
+      "kind": "t-1",
+      "manuscriptId": "broad-spectrum-in-vitro-antimicrobial-activity-of-homologous-platelet-",
+      "title": "Broad-Spectrum In-Vitro Antimicrobial Activity of Homologous Platelet Lysate Against Clinically Relevant Bacterial Pathogens: A Prospective Donor-Pool Study",
+      "due": "2026-09-01T18:29:59.999Z",
+      "at": "2026-08-30T21:19:02.767Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "is-morbid-obesity-a-risk-factor-or-simply-a-surgical-challenge-a-syste|2026-09-07T18:29:59.999Z|new",
+      "kind": "new",
+      "manuscriptId": "is-morbid-obesity-a-risk-factor-or-simply-a-surgical-challenge-a-syste",
+      "title": "Is Morbid Obesity a Risk Factor or Simply a Surgical Challenge? A Systematic Review and Meta-Analysis of Spine Surgery Outcomes",
+      "due": "2026-09-07T18:29:59.999Z",
+      "at": "2026-08-31T20:18:03.975Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "broad-spectrum-in-vitro-antimicrobial-activity-of-homologous-platelet-|2026-09-01T18:29:59.999Z|overdue",
+      "kind": "overdue",
+      "manuscriptId": "broad-spectrum-in-vitro-antimicrobial-activity-of-homologous-platelet-",
+      "title": "Broad-Spectrum In-Vitro Antimicrobial Activity of Homologous Platelet Lysate Against Clinically Relevant Bacterial Pathogens: A Prospective Donor-Pool Study",
+      "due": "2026-09-01T18:29:59.999Z",
+      "at": "2026-09-01T18:41:58.192Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "failure-to-restore-native-roussouly-sagittal-alignment-and-risk-of-adj|2026-09-10T18:29:59.999Z|new",
+      "kind": "new",
+      "manuscriptId": "failure-to-restore-native-roussouly-sagittal-alignment-and-risk-of-adj",
+      "title": "Failure to Restore Native Roussouly Sagittal Alignment and Risk of Adjacent Segment Degeneration after L4–L5 Lumbar Fusion",
+      "due": "2026-09-10T18:29:59.999Z",
+      "at": "2026-09-03T11:38:02.190Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "a-patho-mechanical-classification-of-proximal-radius-fractures-predict|2026-09-17T18:29:59.999Z|new",
+      "kind": "new",
+      "manuscriptId": "a-patho-mechanical-classification-of-proximal-radius-fractures-predict",
+      "title": "A Patho-mechanical Classification of Proximal Radius Fractures Predicting Associated Injuries and Functional Outcomes​",
+      "due": "2026-09-17T18:29:59.999Z",
+      "at": "2026-09-03T11:38:03.066Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "is-morbid-obesity-a-risk-factor-or-simply-a-surgical-challenge-a-syste|2026-09-07T18:29:59.999Z|t-3",
+      "kind": "t-3",
+      "manuscriptId": "is-morbid-obesity-a-risk-factor-or-simply-a-surgical-challenge-a-syste",
+      "title": "Is Morbid Obesity a Risk Factor or Simply a Surgical Challenge? A Systematic Review and Meta-Analysis of Spine Surgery Outcomes",
+      "due": "2026-09-07T18:29:59.999Z",
+      "at": "2026-09-03T19:59:03.102Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "should-spinal-ewing-s-sarcoma-be-managed-differently-from-extremity-di|2026-08-13T18:29:59.999Z|t-3",
+      "kind": "superseded",
+      "manuscriptId": "should-spinal-ewing-s-sarcoma-be-managed-differently-from-extremity-di",
+      "at": "2026-09-05T10:57:48.685Z"
+    },
+    {
+      "key": "should-spinal-ewing-s-sarcoma-be-managed-differently-from-extremity-di|2026-08-13T18:29:59.999Z|t-1",
+      "kind": "superseded",
+      "manuscriptId": "should-spinal-ewing-s-sarcoma-be-managed-differently-from-extremity-di",
+      "at": "2026-09-05T10:57:48.685Z"
+    },
+    {
+      "key": "should-spinal-ewing-s-sarcoma-be-managed-differently-from-extremity-di|2026-08-13T18:29:59.999Z|overdue",
+      "kind": "superseded",
+      "manuscriptId": "should-spinal-ewing-s-sarcoma-be-managed-differently-from-extremity-di",
+      "at": "2026-09-05T10:57:48.685Z"
+    },
+    {
+      "key": "should-spinal-ewing-s-sarcoma-be-managed-differently-from-extremity-di|2026-08-13T18:29:59.999Z|new",
+      "kind": "new",
+      "manuscriptId": "should-spinal-ewing-s-sarcoma-be-managed-differently-from-extremity-di",
+      "title": "Should spinal Ewing's sarcoma be managed differently from extremity disease? A systematic review of outcomes and treatment limitations",
+      "due": "2026-08-13T18:29:59.999Z",
+      "at": "2026-09-05T10:57:48.685Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "is-morbid-obesity-a-risk-factor-or-simply-a-surgical-challenge-a-syste|2026-09-07T18:29:59.999Z|t-1",
+      "kind": "t-1",
+      "manuscriptId": "is-morbid-obesity-a-risk-factor-or-simply-a-surgical-challenge-a-syste",
+      "title": "Is Morbid Obesity a Risk Factor or Simply a Surgical Challenge? A Systematic Review and Meta-Analysis of Spine Surgery Outcomes",
+      "due": "2026-09-07T18:29:59.999Z",
+      "at": "2026-09-05T19:04:38.490Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "failure-to-restore-native-roussouly-sagittal-alignment-and-risk-of-adj|2026-09-10T18:29:59.999Z|t-3",
+      "kind": "t-3",
+      "manuscriptId": "failure-to-restore-native-roussouly-sagittal-alignment-and-risk-of-adj",
+      "title": "Failure to Restore Native Roussouly Sagittal Alignment and Risk of Adjacent Segment Degeneration after L4–L5 Lumbar Fusion",
+      "due": "2026-09-10T18:29:59.999Z",
+      "at": "2026-09-06T19:15:00.659Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "failure-to-restore-native-roussouly-sagittal-alignment-and-risk-of-adj|2026-09-10T18:29:59.999Z|t-1",
+      "kind": "t-1",
+      "manuscriptId": "failure-to-restore-native-roussouly-sagittal-alignment-and-risk-of-adj",
+      "title": "Failure to Restore Native Roussouly Sagittal Alignment and Risk of Adjacent Segment Degeneration after L4–L5 Lumbar Fusion",
+      "due": "2026-09-10T18:29:59.999Z",
+      "at": "2026-09-08T18:46:42.882Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "is-morbid-obesity-a-risk-factor-or-simply-a-surgical-challenge-a-syste|2026-09-16T18:29:59.999Z|new",
+      "kind": "new",
+      "manuscriptId": "is-morbid-obesity-a-risk-factor-or-simply-a-surgical-challenge-a-syste",
+      "title": "Is Morbid Obesity a Risk Factor or Simply a Surgical Challenge? A Systematic Review and Meta-Analysis of Spine Surgery Outcomes",
+      "due": "2026-09-16T18:29:59.999Z",
+      "at": "2026-09-08T21:54:16.381Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "gut-microbiome-and-regenerative-medicine|2026-09-17T18:29:59.999Z|new",
+      "kind": "new",
+      "manuscriptId": "gut-microbiome-and-regenerative-medicine",
+      "title": "Gut Microbiome & Regenerative Medicine",
+      "due": "2026-09-17T18:29:59.999Z",
+      "at": "2026-09-10T06:03:40.779Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "evaluation-of-allelic-variants-of-the-single-nucleotide-polymorphism-p|2026-09-13T18:29:59.999Z|t-3",
+      "kind": "superseded",
+      "manuscriptId": "evaluation-of-allelic-variants-of-the-single-nucleotide-polymorphism-p",
+      "at": "2026-09-10T19:48:56.699Z"
+    },
+    {
+      "key": "evaluation-of-allelic-variants-of-the-single-nucleotide-polymorphism-p|2026-09-13T18:29:59.999Z|new",
+      "kind": "new",
+      "manuscriptId": "evaluation-of-allelic-variants-of-the-single-nucleotide-polymorphism-p",
+      "title": "Evaluation of allelic variants of the single-nucleotide polymorphism PTHLH (rs267606985) in patients undergoing stem cell therapy for knee osteoarthritis",
+      "due": "2026-09-13T18:29:59.999Z",
+      "at": "2026-09-10T19:48:56.699Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "is-morbid-obesity-a-risk-factor-or-simply-a-surgical-challenge-a-syste|2026-09-24T18:29:59.999Z|new",
+      "kind": "new",
+      "manuscriptId": "is-morbid-obesity-a-risk-factor-or-simply-a-surgical-challenge-a-syste",
+      "title": "Is Morbid Obesity a Risk Factor or Simply a Surgical Challenge? A Systematic Review and Meta-Analysis of Spine Surgery Outcomes",
+      "due": "2026-09-24T18:29:59.999Z",
+      "at": "2026-09-10T19:48:57.041Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "evaluation-of-allelic-variants-of-the-single-nucleotide-polymorphism-p|2026-09-13T18:29:59.999Z|t-1",
+      "kind": "t-1",
+      "manuscriptId": "evaluation-of-allelic-variants-of-the-single-nucleotide-polymorphism-p",
+      "title": "Evaluation of allelic variants of the single-nucleotide polymorphism PTHLH (rs267606985) in patients undergoing stem cell therapy for knee osteoarthritis",
+      "due": "2026-09-13T18:29:59.999Z",
+      "at": "2026-09-11T19:47:05.979Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    },
+    {
+      "key": "evaluation-of-allelic-variants-of-the-single-nucleotide-polymorphism-p|2026-09-13T18:29:59.999Z|overdue",
+      "kind": "overdue",
+      "manuscriptId": "evaluation-of-allelic-variants-of-the-single-nucleotide-polymorphism-p",
+      "title": "Evaluation of allelic variants of the single-nucleotide polymorphism PTHLH (rs267606985) in patients undergoing stem cell therapy for knee osteoarthritis",
+      "due": "2026-09-13T18:29:59.999Z",
+      "at": "2026-09-13T19:30:11.959Z",
+      "to": [
+        "Dhibin"
+      ],
+      "failed": []
+    }
+  ],
   "issues": {
     "beyond-body-mass-index-obesity-and-adult-spinal-deformity-surgery-sepa": {
       "number": 9,
       "title": "Amendment 16 days overdue — Beyond Body Mass Index: Obesity and Adult Spinal Deformity Surgery -…",
-      "due": "2026-08-13T18:29:59.999Z"
+      "due": "2026-08-13T18:29:59.999Z",
+      "closed": true
     },
     "national-and-subnational-burden-of-low-back-pain-in-india-1990-2023-a-": {
       "number": 10,
-      "title": "Amendment 10 days overdue — National and subnational burden of low back pain in India, 1990–2023:…",
+      "title": "Amendment 29 days overdue — National and subnational burden of low back pain in India, 1990–2023:…",
       "due": "2026-08-19T18:29:59.999Z"
     },
     "is-three-level-hybrid-cervical-surgery-as-safe-as-three-level-acdf-a-s": {
       "number": 11,
       "title": "Amendment 2 days left — Is Three-Level Hybrid Cervical Surgery as Safe as Three-Level ACDF? A…",
-      "due": "2026-08-31T18:29:59.999Z"
+      "due": "2026-08-31T18:29:59.999Z",
+      "closed": true
     },
     "broad-spectrum-in-vitro-antimicrobial-activity-of-homologous-platelet-": {
       "number": 12,
-      "title": "Amendment 3 days left — Broad-Spectrum In-Vitro Antimicrobial Activity of Homologous Platelet…",
+      "title": "Amendment 16 days overdue — Broad-Spectrum In-Vitro Antimicrobial Activity of Homologous Platelet…",
       "due": "2026-09-01T18:29:59.999Z"
     },
     "does-anatomy-outweigh-biology-in-cervical-spine-giant-cell-tumours-a-s": {
       "number": 13,
       "title": "Amendment 5 days left — Does Anatomy Outweigh Biology in Cervical Spine Giant Cell Tumours? A…",
-      "due": "2026-09-03T18:29:59.999Z"
+      "due": "2026-09-03T18:29:59.999Z",
+      "closed": true
     },
     "minimally-invasive-lumbar-spine-surgery-preserves-functional-recovery-": {
       "number": 14,
       "title": "Amendment 5 days left — Minimally invasive lumbar spine surgery preserves functional recovery…",
-      "due": "2026-09-03T18:29:59.999Z"
+      "due": "2026-09-03T18:29:59.999Z",
+      "closed": true
     },
     "is-morbid-obesity-a-risk-factor-or-simply-a-surgical-challenge-a-syste": {
       "number": 15,
-      "title": "Amendment 13 days left — Is Morbid Obesity a Risk Factor or Simply a Surgical Challenge? A Sys…",
-      "due": "2026-09-11T18:29:59.999Z"
+      "title": "Amendment 9 days left — Is Morbid Obesity a Risk Factor or Simply a Surgical Challenge? A Sys…",
+      "due": "2026-09-24T18:29:59.999Z",
+      "closed": true
+    },
+    "naive-baselines-outperform-bayesian-age-period-cohort-forecasts-of-glo": {
+      "number": 17,
+      "title": "Amendment 60 days left — Naive baselines outperform Bayesian age-period-cohort forecasts of Gl…",
+      "due": "2026-10-29T18:29:59.999Z",
+      "closed": true
+    },
+    "failure-to-restore-native-roussouly-sagittal-alignment-and-risk-of-adj": {
+      "number": 18,
+      "title": "Amendment due today — Failure to Restore Native Roussouly Sagittal Alignment and Risk of Ad…",
+      "due": "2026-09-10T18:29:59.999Z",
+      "closed": true
+    },
+    "a-patho-mechanical-classification-of-proximal-radius-fractures-predict": {
+      "number": 19,
+      "title": "Amendment 5 days left — A Patho-mechanical Classification of Proximal Radius Fractures Predic…",
+      "due": "2026-09-17T18:29:59.999Z",
+      "closed": true
+    },
+    "should-spinal-ewing-s-sarcoma-be-managed-differently-from-extremity-di": {
+      "number": 20,
+      "title": "Amendment 30 days overdue — Should spinal Ewing's sarcoma be managed differently from extremity d…",
+      "due": "2026-08-13T18:29:59.999Z",
+      "closed": true
+    },
+    "gut-microbiome-and-regenerative-medicine": {
+      "number": 21,
+      "title": "Amendment 7 days left — Gut Microbiome & Regenerative Medicine",
+      "due": "2026-09-17T18:29:59.999Z",
+      "closed": true
+    },
+    "evaluation-of-allelic-variants-of-the-single-nucleotide-polymorphism-p": {
+      "number": 22,
+      "title": "Amendment 4 days overdue — Evaluation of allelic variants of the single-nucleotide polymorphism…",
+      "due": "2026-09-13T18:29:59.999Z"
     }
   }
 }

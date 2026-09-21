@@ -1,24 +1,53 @@
 import { requireUnlock, signOut } from "./auth.js";
 import { runSync, waitForFreshData, hasToken, hasOwnToken, setToken, usingProxy, rememberPassphrase } from "./sync.js";
 import { loadConfig } from "./config.js";
-import { FIELDS, SECTIONS, isPinned, editingAvailable, saveEdit, diff } from "./edit.js";
+import { FIELDS, SECTIONS, isPinned, editingAvailable, saveEdit, deleteManuscript, mergeManuscripts, diff } from "./edit.js";
 
 "use strict";
 
+/*
+ * One entry per section, icon included.
+ *
+ * The icon used to live in its own object further down the file, and adding
+ * "Revisions pending" updated this list but not that one -- so the section
+ * picker rendered the string "undefined" inside the icon circle, on top of the
+ * label. Same shape of mistake as the section counts, which read zero for the
+ * same reason. Anything per-section belongs here, where adding a section means
+ * filling in the row rather than remembering the other places.
+ */
 const BUCKET_META = {
-  submissions: { label: "Submissions", pill: "submissions" },
-  needs_action: { label: "Needs action", pill: "needs_action" },
-  in_review: { label: "In review", pill: "in_review" },
-  published: { label: "Published", pill: "published" },
+  in_review: { label: "With the journal", pill: "in_review", icon: "◷" },
+  needs_action: { label: "Needs action", pill: "needs_action", icon: "!" },
+  revisions_pending: { label: "Revisions pending", pill: "revisions_pending", icon: "↻" },
+  published: { label: "Published", pill: "published", icon: "✓" },
 };
+
+/*
+ * A section this build does not know must not blank the page.
+ *
+ * Reading BUCKET_META directly threw on any unrecognised bucket, and the
+ * whole card list went with it -- one stale record, or a browser holding the
+ * previous data file after "Submissions" was merged away, and the dashboard
+ * renders nothing at all. A card for an unknown section is still a card worth
+ * showing; it just says what it does not recognise.
+ */
+function bucketMeta(bucket) {
+  return BUCKET_META[bucket] || {
+    label: bucket ? String(bucket).replace(/_/g, " ") : "Unfiled",
+    pill: "in_review",
+    icon: "·",
+  };
+}
 
 const BUCKET_HINTS = {
   all: "Every manuscript being tracked. Anything on a deadline comes first, most urgent at the top; the rest follow by newest activity.",
-  submissions: "Freshly submitted — acknowledged by a journal, awaiting a first editorial check.",
+
   needs_action: "Needs you: rejected papers to resubmit elsewhere, or manuscripts returned for edits before peer review.",
-  in_review: "With the journal — under peer review, revision in progress, or accepted and awaiting publication.",
+  revisions_pending: "Reviewed, and coming back to you: the journal has asked for revisions and is waiting on the revised manuscript.",
+  in_review: "With the journal — submitted, under peer review, or accepted and awaiting publication. Submissions and review are one section: not every journal acknowledges a submission, and none writes to say a paper reached an editor, so separating them sorted papers by their journal's mail habits rather than by where they stood.",
   published: "Published, with DOI and article link where available.",
   review: "Emails the classifier would not guess at. Nothing here has been filed on a guess — check each one and correct the record.",
+  journals: "Every journal this group has submitted to, and what happened at each. Open one to see its papers and where each stands with that journal — not where the paper is now, which may be somewhere else entirely.",
 };
 
 const NEEDS_ACTION_REASON = {
@@ -41,7 +70,7 @@ const EVENT_LABELS = {
 // `review` holds the entries the classifier declined to guess at. Some
 // correspond to a filed manuscript (flagged on its card); the rest were never
 // filable at all and would otherwise be invisible.
-let state = { manuscripts: [], review: [], bucket: "all", query: "", generatedAt: null };
+let state = { manuscripts: [], review: [], bucket: "all", query: "", generatedAt: null, journal: null };
 
 /**
  * How long is left on an amendment. Counted in whole calendar days in the
@@ -233,6 +262,9 @@ async function load() {
 /** Select a filter and sync the nav, so a bucket can be reached by URL hash too. */
 function selectBucket(bucket) {
   if (!BUCKET_HINTS[bucket]) bucket = "all";
+  // Leaving the journals view drops whichever journal was open, or coming back
+  // to it later would land inside a journal nobody asked for.
+  if (bucket !== "journals") state.journal = null;
   state.bucket = bucket;
   $$(".bucket-btn").forEach((b) => b.classList.toggle("active", b.dataset.bucket === bucket));
   render();
@@ -245,6 +277,9 @@ function unfiledReview() {
 
 /** Why a filed manuscript was flagged, matched back from the review queue. */
 function reviewReasonFor(m) {
+  // The record's own reason wins: it says why THIS record was flagged, where
+  // the review queue is matched by title and can only ever offer a guess.
+  if (m.reviewReason) return m.reviewReason;
   const hit = state.review.find(
     (r) => r.relevant === true && r.title && m.title && r.title.trim() === m.title.trim()
   );
@@ -252,9 +287,15 @@ function reviewReasonFor(m) {
 }
 
 function counts() {
-  const c = { all: state.manuscripts.length, submissions: 0, needs_action: 0, in_review: 0, published: 0 };
+  // Seeded from BUCKET_META rather than a hand-written list, because the two
+  // drifted the moment a section was added: the filter worked and its badge
+  // sat at zero, which reads as "nothing here" on the one control meant to
+  // tell you there is.
+  const c = { all: state.manuscripts.length };
+  for (const bucket of Object.keys(BUCKET_META)) c[bucket] = 0;
   for (const m of state.manuscripts) if (c[m.bucket] !== undefined) c[m.bucket]++;
   c.review = state.manuscripts.filter((m) => m.needsReview).length + unfiledReview().length;
+  c.journals = journalGroups().length;
   return c;
 }
 
@@ -267,6 +308,10 @@ function matchesQuery(m, q) {
   if (!q) return true;
   const hay = [
     m.title,
+    // Previous titles too. A paper retitled between submissions is still the
+    // one you are looking for, and searching for the name you submitted under
+    // is the most natural thing to try.
+    ...(m.titleAliases || []),
     m.currentJournal,
     m.currentManuscriptNumber,
     ...(m.submissions || []).map((s) => `${s.journal} ${s.manuscriptNumber || ""}`),
@@ -352,8 +397,177 @@ function reviewCardHtml(r) {
   </article>`;
 }
 
+/*
+ * How long each section may go quiet before the silence is the news.
+ *
+ * Duplicated from STALE_AFTER_DAYS in scripts/lib/registry.mjs, which the
+ * browser cannot import from. Keep the two in step.
+ *
+ * Sixty-two of the 128 papers here sit in Submissions, silent for a median of
+ * 76 days and 29 of them for over 90 with one email to their name. Those were
+ * not still under consideration -- the tracker never heard the answer. Without
+ * this a section cannot tell waiting from lost, and the largest one on the
+ * board is mostly lost.
+ */
+const STALE_AFTER_DAYS = {
+  in_review: 90,
+  revisions_pending: 30,
+  needs_action: 45,
+  published: Infinity,
+};
+
+function silence(m, now = Date.now()) {
+  const last = m && m.updatedAt ? Date.parse(m.updatedAt) : NaN;
+  if (!Number.isFinite(last)) return null;
+  const days = Math.floor((now - last) / 86400000);
+  return { days, stale: days > (STALE_AFTER_DAYS[m.bucket] ?? Infinity) };
+}
+
+/**
+ * Shown only once the silence is longer than the section allows, so it stays
+ * a signal. A badge on every card is wallpaper.
+ */
+function silenceChip(m) {
+  const q = silence(m);
+  if (!q || !q.stale) return "";
+  const months = Math.floor(q.days / 30);
+  const howLong = months >= 2 ? `${months} months` : `${q.days} days`;
+  return `<span class="silence-chip" title="Nothing has been heard about this since ${esc(fmtDate(m.updatedAt))}. Chase the journal, or correct the record by hand.">◌ Silent ${esc(howLong)}</span>`;
+}
+
+/*
+ * Every journal this group has dealt with, and what happened at each.
+ *
+ * Grouped by SUBMISSION, not by where the paper is now. A paper rejected by
+ * Global Spine Journal and later published elsewhere still belongs in Global
+ * Spine Journal's history -- that rejection is the most useful thing that
+ * journal has told you, and grouping by current journal would hide it. So one
+ * paper can appear under several journals, once per submission, which is what
+ * "which journal has which papers" actually means when papers move.
+ *
+ * Journal names arrive as the journal types them, so "International
+ * Orthopaedics" and "international orthopaedics" are one journal; the longest
+ * spelling seen is used as the label, being the one most likely to be complete.
+ */
+function journalGroups() {
+  const byKey = new Map();
+
+  for (const m of state.manuscripts) {
+    // A paper with no submission record still belongs somewhere, or it would
+    // vanish from this view entirely.
+    const entries = (m.submissions || []).length
+      ? (m.submissions || []).map((sub) => ({ journal: sub.journal, sub }))
+      : [{ journal: m.currentJournal, sub: null }];
+
+    for (const { journal, sub } of entries) {
+      const name = (journal || "").trim();
+      if (!name) continue;
+      const key = name.toLowerCase();
+      if (!byKey.has(key)) byKey.set(key, { name, papers: [] });
+      const group = byKey.get(key);
+      if (name.length > group.name.length) group.name = name;
+      group.papers.push({ m, sub, standing: standingAt(m, sub) });
+    }
+  }
+
+  for (const g of byKey.values()) {
+    g.live = g.papers.filter((p) => p.standing.live).length;
+    /*
+     * In date order, newest first, by when the paper went to THIS journal --
+     * not by when the record last changed, which mixed a 2026 submission in
+     * among 2025 ones because some unrelated email touched it yesterday.
+     * Papers whose submission carries no date fall to the end rather than
+     * being sorted as though they arrived in 1970.
+     */
+    g.papers.sort((a, b) => {
+      const at = dateOfSubmission(a);
+      const bt = dateOfSubmission(b);
+      if (at === null || bt === null) return at === null ? (bt === null ? 0 : 1) : -1;
+      return bt - at;
+    });
+  }
+
+  return [...byKey.values()].sort(
+    (a, b) => b.live - a.live || b.papers.length - a.papers.length || a.name.localeCompare(b.name)
+  );
+}
+
+/**
+ * Where a paper stands WITH THIS JOURNAL, which is not the same as where the
+ * paper stands. A paper rejected here and now under review elsewhere reads
+ * "Rejected" under this journal and "In review" on its own card, and both are
+ * true.
+ */
+function standingAt(m, sub) {
+  if (!sub) {
+    const meta = bucketMeta(m.bucket);
+    return { live: m.bucket !== "published", label: meta.label, tone: m.bucket };
+  }
+  const outcome = (sub.outcome || "").toLowerCase();
+  if (outcome === "rejected") return { live: false, label: "Rejected", tone: "needs_action" };
+  if (outcome === "transferred") return { live: false, label: "Transferred out", tone: "needs_action" };
+  if (outcome === "published") return { live: false, label: "Published", tone: "published" };
+  // Still open here: say which stage, taking it from the paper's own section
+  // since that is what the last email about it established.
+  const meta = bucketMeta(m.bucket);
+  return { live: true, label: meta.label, tone: m.bucket };
+}
+
+/** When this paper went to this journal, or null when nothing says. */
+function dateOfSubmission(p) {
+  const raw = p.sub?.submittedDate || p.sub?.statusHistory?.[0]?.timestamp || p.m.createdAt;
+  const at = raw ? Date.parse(raw) : NaN;
+  return Number.isFinite(at) ? at : null;
+}
+
+function journalMatches(g, q) {
+  if (!q) return true;
+  const needle = q.toLowerCase();
+  if (g.name.toLowerCase().includes(needle)) return true;
+  return g.papers.some((p) => matchesQuery(p.m, q));
+}
+
+function journalCardHtml(g) {
+  const stages = {};
+  for (const p of g.papers) stages[p.standing.label] = (stages[p.standing.label] || 0) + 1;
+  const newest = g.papers.map((p) => p.m.updatedAt).filter(Boolean).sort().pop();
+
+  return `
+  <article class="card journal-card" data-journal="${esc(g.name)}" tabindex="0" role="button">
+    <div class="card-top">
+      <span class="pill ${g.live ? "in_review" : "published"}">${g.live ? `${g.live} open` : "None open"}</span>
+      <span class="journal-total">${g.papers.length} paper${g.papers.length === 1 ? "" : "s"}</span>
+    </div>
+    <h3 class="card-title">${esc(g.name)}</h3>
+    <div class="journal-stages">
+      ${Object.entries(stages).map(([label, n]) => `<span class="journal-stage">${esc(label)} · ${n}</span>`).join("")}
+    </div>
+    <div class="card-foot">
+      <span class="card-when">${newest ? "Last heard " + esc(fmtRelative(newest)) : "No dated activity"}</span>
+    </div>
+  </article>`;
+}
+
+function journalPaperRowHtml(p) {
+  const ref = p.sub?.manuscriptNumber || p.m.currentManuscriptNumber;
+  return `
+  <article class="card journal-paper" data-id="${esc(p.m.id)}" tabindex="0" role="button">
+    <div class="card-top">
+      <span class="pill ${p.standing.tone}">${esc(p.standing.label)}</span>
+      ${ref ? `<span class="journal-total">${esc(ref)}</span>` : ""}
+      ${silenceChip(p.m)}
+    </div>
+    <h3 class="card-title">${esc(p.m.title)}</h3>
+    <div class="card-foot">
+      <span class="card-when">${dateOfSubmission(p) === null
+        ? "No submission date"
+        : "Submitted " + esc(fmtDate(new Date(dateOfSubmission(p)).toISOString()))}</span>
+    </div>
+  </article>`;
+}
+
 function cardHtml(m) {
-  const pill = BUCKET_META[m.bucket];
+  const pill = bucketMeta(m.bucket);
   const attnReason = m.needsActionReason ? NEEDS_ACTION_REASON[m.needsActionReason] : null;
   const chain = (m.submissions || []).length;
   const lastEvent = m.timeline?.[m.timeline.length - 1];
@@ -369,6 +583,7 @@ function cardHtml(m) {
     <div class="card-top">
       <span class="pill ${pill.pill}">${esc(pill.label)}</span>
       ${deadlineChip(m)}
+      ${silenceChip(m)}
       ${m.actionFlag ? `<span class="action-flag">● ${esc(m.actionLabel || "Action")}</span>` : ""}
       ${m.needsReview ? `<span class="review-flag" title="${esc(reviewReasonFor(m))}">⚑ Check</span>` : ""}
     </div>
@@ -390,10 +605,13 @@ function cardHtml(m) {
 }
 
 function render() {
-  const list = filtered();
   const cards = $("#cards");
   const empty = $("#empty");
   $("#bucket-hint").textContent = BUCKET_HINTS[state.bucket] || "";
+
+  if (state.bucket === "journals") return renderJournals(cards, empty);
+
+  const list = filtered();
 
   // The review view also surfaces items that never became a manuscript.
   const extras =
@@ -413,6 +631,47 @@ function render() {
   }
   empty.hidden = true;
   cards.innerHTML = list.map(cardHtml).join("") + extras.map(reviewCardHtml).join("");
+}
+
+/**
+ * Two screens behind one button: the journals, and one journal's papers.
+ *
+ * Kept inside the ordinary card grid rather than given a page of its own, so
+ * search, the detail drawer and the back button all go on working -- a second
+ * page would have had to reimplement each of them.
+ */
+function renderJournals(cards, empty) {
+  if (state.journal) {
+    const group = journalGroups().find((g) => g.name === state.journal);
+    if (!group) { state.journal = null; return renderJournals(cards, empty); }
+
+    const papers = group.papers.filter((p) => matchesQuery(p.m, state.query));
+    $("#bucket-hint").innerHTML =
+      `<button type="button" id="journal-back" class="journal-back">← All journals</button>` +
+      `<span class="journal-heading">${esc(group.name)} — ${papers.length} paper${papers.length === 1 ? "" : "s"}</span>`;
+
+    if (!papers.length) {
+      cards.innerHTML = "";
+      empty.hidden = false;
+      empty.innerHTML = `<h3>Nothing matches</h3><p>No paper at ${esc(group.name)} matches this search.</p>`;
+      return;
+    }
+    empty.hidden = true;
+    cards.innerHTML = papers.map(journalPaperRowHtml).join("");
+    return;
+  }
+
+  const groups = journalGroups().filter((g) => journalMatches(g, state.query));
+  if (!groups.length) {
+    cards.innerHTML = "";
+    empty.hidden = false;
+    empty.innerHTML = state.manuscripts.length
+      ? `<h3>No journals match</h3><p>Nothing here matches this search.</p>`
+      : `<h3>No journals yet</h3><p>Once the sync files a submission, the journals appear here.</p>`;
+    return;
+  }
+  empty.hidden = true;
+  cards.innerHTML = groups.map(journalCardHtml).join("");
 }
 
 // A pinned field is one the sync is no longer allowed to touch. That is a
@@ -472,7 +731,7 @@ function sourceMailHtml(e) {
 }
 
 function drawerHtml(m) {
-  const pill = BUCKET_META[m.bucket];
+  const pill = bucketMeta(m.bucket);
   const attnReason = m.needsActionReason ? NEEDS_ACTION_REASON[m.needsActionReason] : null;
   const lastEdit = (m.edits || [])[m.edits?.length - 1];
 
@@ -557,6 +816,73 @@ function drawerHtml(m) {
 }
 
 /**
+ * Every other manuscript, with the likely duplicates lifted to the top.
+ *
+ * Grouped rather than filtered: the suggestions are a convenience, not a
+ * gate. A person merging two cards can see something the similarity score
+ * cannot, and the list must not argue with them.
+ */
+function mergeOptionsHtml(m) {
+  const label = (x) =>
+    `${x.title.slice(0, 70)}${x.currentJournal ? ` — ${x.currentJournal}` : ""}` +
+    `${x.currentManuscriptNumber ? ` (${x.currentManuscriptNumber})` : ""}`;
+
+  const suggested = mergeCandidates(m);
+  const suggestedIds = new Set(suggested.map((c) => c.m.id));
+  const rest = state.manuscripts
+    .filter((x) => x.id !== m.id && !suggestedIds.has(x.id))
+    .sort((a, b) => a.title.localeCompare(b.title));
+
+  const group = (name, rows) =>
+    rows.length
+      ? `<optgroup label="${esc(name)}">` +
+        rows.map((x) => `<option value="${esc(x.id)}">${esc(label(x))}</option>`).join("") +
+        `</optgroup>`
+      : "";
+
+  return group("Likely the same paper", suggested.map((c) => c.m)) +
+         group(suggested.length ? "Every other manuscript" : "All manuscripts", rest);
+}
+
+/**
+ * Records that might be this same paper.
+ *
+ * Scored the way the matcher scores, so the list is exactly the population it
+ * could have split: a shared manuscript number once the revision round is
+ * stripped, or a title close enough that the old matcher would have merged
+ * them. Ordered with the strongest first.
+ */
+function mergeCandidates(m) {
+  const base = (n) => (n || "").trim().replace(/[._\s-]*R\d+$/i, "").toLowerCase();
+  const mine = new Set((m.submissions || []).map((s) => base(s.manuscriptNumber)).filter(Boolean));
+  const out = [];
+  for (const other of state.manuscripts) {
+    if (other.id === m.id) continue;
+    const theirs = (other.submissions || []).map((s) => base(s.manuscriptNumber)).filter(Boolean);
+    const sharesNumber = theirs.some((n) => mine.has(n));
+    const score = titleCloseness(m.title, other.title);
+    if (sharesNumber || score >= 0.82) out.push({ m: other, score: sharesNumber ? 2 : score });
+  }
+  return out.sort((a, b) => b.score - a.score).slice(0, 8);
+}
+
+/** The matcher's own measure: Dice over character bigrams. */
+function titleCloseness(a, b) {
+  const norm = (t) => (t || "").toLowerCase().replace(/&/g, " and ")
+    .normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9 ]/g, " ").replace(/\s+/g, " ").trim();
+  const na = norm(a), nb = norm(b);
+  if (!na || !nb) return 0;
+  if (na === nb) return 1;
+  const grams = (x) => { const s = new Set(); for (let i = 0; i < x.length - 1; i++) s.add(x.slice(i, i + 2)); return s; };
+  const ga = grams(na), gb = grams(nb);
+  if (!ga.size || !gb.size) return 0;
+  let hit = 0;
+  for (const g of ga) if (gb.has(g)) hit++;
+  return (2 * hit) / (ga.size + gb.size);
+}
+
+/**
  * The edit form.
  *
  * Two things here are worth more than they look. The first is the section
@@ -574,7 +900,7 @@ function editFormHtml(m) {
   const sections = SECTIONS.map((s) => `
     <button type="button" class="section-chip ${m.bucket === s.bucket ? "active" : ""}"
             data-bucket="${s.bucket}" aria-pressed="${m.bucket === s.bucket}">
-      <span class="bucket-icon ${s.bucket}">${BUCKET_ICON[s.bucket]}</span>${esc(s.label)}
+      <span class="bucket-icon ${s.bucket}">${BUCKET_META[s.bucket]?.icon || ""}</span>${esc(s.label)}
     </button>`).join("");
 
   const fields = FIELDS.map((f) => {
@@ -621,14 +947,64 @@ function editFormHtml(m) {
       ${fields}
 
       <p id="edit-error" class="lock-error" hidden role="alert"></p>
+
+      <!--
+        Any card, not only the ones that score as similar.
+        
+        This used to offer only records above the matcher's own similarity bar,
+        which meant the merge could not reach the very cases a person can see
+        and the machine cannot: "…as Safe as Three-Level ACDF" and "…as Safe as
+        Anterior Cervical Discectomy and Fusion" are one paper whose title a
+        journal truncated, and they score 0.70 -- well under the bar. A manual
+        merge that only offers the automatic guesses is not a manual merge.
+        
+        The likely ones still come first, since they are usually right.
+      -->
+      <div class="edit-field" data-field="merge">
+        <div class="edit-label-row"><label for="merge-into">Same paper as another card?</label></div>
+        <div class="merge-row">
+          <select id="merge-into">
+            <option value="">Choose the duplicate to fold in…</option>
+            ${mergeOptionsHtml(m)}
+          </select>
+          <button type="button" id="edit-merge" class="sync-close">Merge in</button>
+        </div>
+        <p class="edit-help">
+          Its events, submissions and title all move onto this card, and this card's
+          title is the one that stays. The other card goes. Type in the list to search
+          it — every manuscript is there, not only the ones that look alike.
+        </p>
+      </div>
+
       <div class="edit-actions">
+        <button type="button" id="edit-delete" class="edit-danger">Delete this manuscript</button>
         <button type="button" id="edit-cancel" class="sync-close">Cancel</button>
         <button type="submit" id="edit-save" class="lock-btn">Save changes</button>
+      </div>
+
+      <!--
+        The confirmation is a panel rather than a browser prompt so it can show
+        what is actually about to be lost -- this paper's own title and how
+        much history goes with it -- and say the one thing a person cannot
+        guess: that a later email will file the paper again.
+      -->
+      <div id="edit-delete-confirm" class="edit-confirm" hidden>
+        <p class="edit-confirm-lead">Delete <b>${esc(m.title)}</b>?</p>
+        <p class="edit-confirm-body">
+          This removes the card and its ${(m.timeline || []).length} timeline
+          ${(m.timeline || []).length === 1 ? "entry" : "entries"} from the tracker.
+          The emails behind it are untouched, so a <b>new</b> message about this paper
+          will file it again. The change is a commit, so it stays in the repository's
+          history either way.
+        </p>
+        <div class="edit-confirm-actions">
+          <button type="button" id="edit-delete-cancel" class="sync-close">Keep it</button>
+          <button type="button" id="edit-delete-go" class="edit-danger-solid">Delete permanently</button>
+        </div>
       </div>
     </form>`;
 }
 
-const BUCKET_ICON = { submissions: "↑", needs_action: "!", in_review: "◷", published: "✓" };
 
 // The manuscript on screen, and which of its fields the person has asked to
 // hand back to automation during this edit.
@@ -702,7 +1078,108 @@ function wireEditForm(m) {
     editing = null;
     renderDrawer();
   });
+
+  // Deleting is two clicks with the consequences in between, and the panel
+  // hides the save row while it is open -- there is no sensible reading of
+  // "Save changes" pressed on a manuscript being deleted.
+  const confirmPanel = $("#edit-delete-confirm");
+  const actions = form.querySelector(".edit-actions");
+  $("#edit-delete").addEventListener("click", () => {
+    actions.hidden = true;
+    confirmPanel.hidden = false;
+    $("#edit-delete-go").focus();
+  });
+  $("#edit-delete-cancel").addEventListener("click", () => {
+    confirmPanel.hidden = true;
+    actions.hidden = false;
+    $("#edit-delete").focus();
+  });
+  $("#edit-delete-go").addEventListener("click", () => { void submitDelete(m); });
+
+  const mergeBtn = $("#edit-merge");
+  if (mergeBtn) mergeBtn.addEventListener("click", () => {
+    const from = $("#merge-into").value;
+    if (!from) return;
+    const other = state.manuscripts.find((x) => x.id === from);
+    if (!other) return;
+    if (!confirm(
+      `Fold "${other.title.slice(0, 70)}" into this card?\n\n` +
+      `Its ${(other.timeline || []).length} timeline entr${(other.timeline || []).length === 1 ? "y" : "ies"} ` +
+      `and ${(other.submissions || []).length} submission(s) move here. That card then goes, and this card's title stays.`
+    )) return;
+    void submitMerge(m, from);
+  });
+
   form.addEventListener("submit", (e) => { e.preventDefault(); void submitEdit(m); });
+}
+
+async function submitMerge(m, fromId) {
+  const error = $("#edit-error");
+  const btn = $("#edit-merge");
+  error.hidden = true;
+  btn.disabled = true;
+  btn.textContent = "Merging…";
+  try {
+    const result = await mergeManuscripts(m.id, fromId);
+    // Both halves change at once, so replace the survivor and drop the other
+    // rather than re-reading the data file, which lags the commit by minutes.
+    state.manuscripts = state.manuscripts.filter((x) => x.id !== fromId);
+    const i = state.manuscripts.findIndex((x) => x.id === m.id);
+    if (i >= 0 && result.manuscript) state.manuscripts[i] = result.manuscript;
+    editing = null;
+    renderCounts();
+    render();
+    renderDrawer();
+  } catch (err) {
+    if (err.code === "auth") {
+      btn.disabled = false;
+      btn.textContent = "Merge in";
+      if (await askForToken()) void submitMerge(m, fromId);
+      return;
+    }
+    error.textContent = err.message || "The records could not be merged.";
+    error.hidden = false;
+    btn.disabled = false;
+    btn.textContent = "Merge in";
+    console.error(err);
+  }
+}
+
+async function submitDelete(m) {
+  const error = $("#edit-error");
+  const go = $("#edit-delete-go");
+
+  error.hidden = true;
+  go.disabled = true;
+  go.textContent = "Deleting…";
+
+  try {
+    await deleteManuscript(m.id);
+    // Drop it locally rather than re-reading the data file: the commit takes a
+    // minute or two to reach the served copy, and re-reading now would show the
+    // card come back before disappearing again.
+    state.manuscripts = state.manuscripts.filter((x) => x.id !== m.id);
+    editing = null;
+    closeDrawer();
+    renderCounts();
+    render();
+  } catch (err) {
+    if (err.code === "auth") {
+      go.disabled = false;
+      go.textContent = "Delete permanently";
+      if (await askForToken()) void submitDelete(m);
+      return;
+    }
+    // Put the person back where they can decide again, rather than leaving a
+    // dead confirm panel with an error under it.
+    $("#edit-delete-confirm").hidden = true;
+    $("#edit-form").querySelector(".edit-actions").hidden = false;
+    error.textContent = err.message || "The manuscript could not be deleted.";
+    error.hidden = false;
+    go.disabled = false;
+    go.textContent = "Delete permanently";
+    console.error(err);
+  }
 }
 
 async function submitEdit(m) {
@@ -785,15 +1262,28 @@ function wire() {
     if (history.replaceState) history.replaceState(null, "", `#${btn.dataset.bucket}`);
   });
   $("#search").addEventListener("input", (e) => { state.query = e.target.value.trim(); render(); });
-  $("#cards").addEventListener("click", (e) => {
-    const card = e.target.closest(".card");
-    if (card) openDrawer(card.dataset.id);
-  });
+  // A journal card opens its papers; everything else opens the drawer.
+  const activate = (card) => {
+    if (!card) return;
+    if (card.dataset.journal) {
+      state.journal = card.dataset.journal;
+      render();
+      return;
+    }
+    if (card.dataset.id) openDrawer(card.dataset.id);
+  };
+  $("#cards").addEventListener("click", (e) => activate(e.target.closest(".card")));
   $("#cards").addEventListener("keydown", (e) => {
     if ((e.key === "Enter" || e.key === " ") && e.target.classList.contains("card")) {
       e.preventDefault();
-      openDrawer(e.target.dataset.id);
+      activate(e.target);
     }
+  });
+  // The hint strip carries the way back out of a journal.
+  $("#bucket-hint").addEventListener("click", (e) => {
+    if (!e.target.closest("#journal-back")) return;
+    state.journal = null;
+    render();
   });
   $("#drawer-edit").addEventListener("click", () => {
     editing = { released: new Set(), dirty: false };

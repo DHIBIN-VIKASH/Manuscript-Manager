@@ -5,6 +5,8 @@ import { buildClient, fetchNewMessages, credentialsFor, providerOf } from "./lib
 import { classifyEmail } from "./lib/classify.mjs";
 import { applyEvent } from "./lib/registry.mjs";
 import { PREFILTER } from "./lib/prefilter.mjs";
+import { classifyBySubject } from "./lib/subject-rules.mjs";
+import { ourAddresses, isFromOurselves } from "./lib/ourselves.mjs";
 import { resolveDeadline } from "./lib/deadline.mjs";
 
 const ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
@@ -44,11 +46,45 @@ const ON_A_CLOCK = { sent_back: true, revision_requested: true };
  * SYNC_RESCAN=1 to reconsider those too -- the registry dedupes by message id,
  * so re-filing is safe, but it spends the LLM budget again.
  */
+/**
+ * A sweep window, validated here rather than where it is used.
+ *
+ * `new Date("whatever")` does not throw -- it returns an Invalid Date that
+ * behaves normally until something calls toISOString() on it, which then
+ * throws a bare "RangeError: Invalid time value" from inside a log line. One
+ * mistyped date in the workflow's dispatch box cost a whole run that way, and
+ * the stack trace pointed at the logging rather than at the input.
+ *
+ * Checking at the edge means a bad value is named, with the format it wanted,
+ * before any mailbox is opened.
+ */
+function sweepDate(raw, which) {
+  if (!raw || !raw.trim()) return null;
+  const at = new Date(raw.trim());
+  if (Number.isNaN(at.getTime())) {
+    console.error(
+      `${which} is not a date I can read: "${raw}".\n` +
+      "Use YYYY-MM-DD (for example 2026-08-01), or leave it blank for an " +
+      "ordinary incremental run."
+    );
+    process.exit(1);
+  }
+  return at;
+}
+
 const SWEEP = {
-  since: process.env.SYNC_SINCE ? new Date(process.env.SYNC_SINCE) : null,
-  until: process.env.SYNC_UNTIL ? new Date(process.env.SYNC_UNTIL) : null,
+  since: sweepDate(process.env.SYNC_SINCE, "SYNC_SINCE"),
+  until: sweepDate(process.env.SYNC_UNTIL, "SYNC_UNTIL"),
   rescan: process.env.SYNC_RESCAN === "1",
 };
+
+if (SWEEP.since && SWEEP.until && SWEEP.until <= SWEEP.since) {
+  console.error(
+    `SYNC_UNTIL (${SWEEP.until.toISOString().slice(0, 10)}) is not after ` +
+    `SYNC_SINCE (${SWEEP.since.toISOString().slice(0, 10)}), so the window is empty.`
+  );
+  process.exit(1);
+}
 const sweeping = Boolean(SWEEP.since || SWEEP.until);
 
 const DEFAULT_LOOKBACK_DAYS = 30; // first run per account
@@ -74,7 +110,18 @@ const MAX_CLASSIFY_ATTEMPTS = 3;
 
 // After this many rate limits in a row, treat the daily quota as spent and defer
 // the rest of the account's mail to the next run.
-const RATE_LIMIT_GIVE_UP = Number(process.env.RATE_LIMIT_GIVE_UP || 5);
+//
+// Two, not five. A rate-limited message is not cheap to give up on: every
+// provider in the chain is tried twice, and each retry waits out the backoff
+// the provider asked for, capped at 30 seconds. That is about 100 seconds of
+// sleeping per message, so five confirmations cost roughly eight minutes PER
+// MAILBOX to establish what the second one already had. Profiling a real run
+// showed 16 of its 16.4 minutes spent this way.
+//
+// The cost of being wrong is small and self-correcting: if the quota had in
+// fact just recovered, the deferred mail is picked up by the next run with no
+// penalty and nothing is lost.
+const RATE_LIMIT_GIVE_UP = Number(process.env.RATE_LIMIT_GIVE_UP || 2);
 
 
 async function loadJson(file, fallback) {
@@ -99,6 +146,22 @@ function hasClassifierKey() {
 
 async function main() {
   const { accounts } = await loadJson(P.accounts, { accounts: [] });
+
+  /*
+   * Everyone whose own mail is the group talking to itself.
+   *
+   * Built from the polled accounts, plus OUR_OTHER_ADDRESSES for anything that
+   * forwards into one of them -- dhibinvikash@outlook.com is not polled
+   * directly but its mail lands in the Gmail account, so a forward from it is
+   * still internal.
+   */
+  const ours = ourAddresses(
+    accounts,
+    (process.env.OUR_OTHER_ADDRESSES || "dhibinvikash@outlook.com")
+      .split(",")
+      .map((x) => x.trim())
+      .filter(Boolean)
+  );
   const manuscriptsDb = await loadJson(P.manuscripts, { generatedAt: null, manuscripts: [] });
   const state = await loadJson(P.state, { accounts: {} });
   const excludedLog = await loadJson(P.excluded, { excluded: [] });
@@ -115,6 +178,7 @@ async function main() {
   }
 
   let totalFetched = 0;
+  let totalSuppressed = 0;
   let totalRelevant = 0;
   let totalExcluded = 0;
   let totalReview = 0;
@@ -142,10 +206,28 @@ async function main() {
     // can't starve the rest during a backlog.
     let accountBudget = Math.max(1, Math.floor(MAX_CLASSIFICATIONS_PER_RUN / activeAccounts));
 
+    /*
+     * The overlap applies to a window that finished, never to one being held.
+     *
+     * A clean run leaves the watermark at "now", and re-scanning the last two
+     * days catches anything that landed at the boundary. But a run with work
+     * remaining rewinds the watermark to the oldest message it did not decide
+     * -- and that message can sit inside the overlap it just scanned. Taking
+     * another two days off THAT walks the window backwards, every run, without
+     * bound: this mailbox went from 8 August to 5 August in a day, and moving
+     * from a three-hourly schedule to an hourly one tripled the rate of it.
+     *
+     * So the overlap is a safety margin on a completed window only. While the
+     * window is held, `since` is the watermark itself: the held position is
+     * already the oldest thing outstanding, and there is nothing before it
+     * this run has not seen.
+     */
+    const holding = Boolean(acctState.holding);
+    const overlapMs = holding ? 0 : OVERLAP_DAYS * 86400000;
     const since = SWEEP.since
       ? SWEEP.since
       : acctState.lastSyncedAt
-      ? new Date(new Date(acctState.lastSyncedAt).getTime() - OVERLAP_DAYS * 86400000)
+      ? new Date(new Date(acctState.lastSyncedAt).getTime() - overlapMs)
       : new Date(Date.now() - DEFAULT_LOOKBACK_DAYS * 86400000);
 
     const mailbox = buildClient(account);
@@ -187,6 +269,29 @@ async function main() {
       const candidateText = `${msg.subject} ${msg.from} ${msg.text}`;
       if (!PREFILTER.test(candidateText)) {
         seenIds.add(msg.id); // a decision: not journal correspondence, never revisit
+        continue;
+      }
+
+      /*
+       * One of us forwarding a journal's letter to another of us.
+       *
+       * The forward carries today's date, not the journal's, and the registry
+       * reads the newest event as the present -- so a rejection forwarded
+       * weeks later drags a paper back to "rejected" after it has already been
+       * submitted somewhere else. It also carries nothing new: if the journal
+       * wrote to a mailbox we poll, the original is filed already, correctly
+       * dated. Settled here rather than at the classifier, so it costs nothing.
+       */
+      if (isFromOurselves(msg.from, ours)) {
+        seenIds.add(msg.id);
+        totalExcluded++;
+        excludedLog.excluded.unshift({
+          timestamp: msg.internalDate,
+          reason: "forwarded_between_us",
+          subject: msg.subject,
+          from: msg.from,
+          account: account.email,
+        });
         continue;
       }
 
@@ -279,6 +384,29 @@ async function main() {
         from: msg.from,
       };
 
+      /*
+       * A second opinion that costs nothing.
+       *
+       * Some subject lines have meant exactly one thing across every email
+       * this tracker has read -- "...-Amendment required" has never been
+       * anything but sent back. check-subject-rules.mjs proves that against
+       * the whole registry and refuses any rule that has ever been two things.
+       * So when the model reads one of those and answers something else, one
+       * of them is wrong and a person should look.
+       *
+       * It flags rather than overrules: the rule sees a subject, the model saw
+       * the body, and the body is usually the better witness. But this is how
+       * the mislabelled ones get found instead of sitting there.
+       */
+      const bySubject = classifyBySubject(msg.subject);
+      if (bySubject && result.relevant && result.event_type &&
+          bySubject.eventType !== result.event_type) {
+        result.needsReview = true;
+        result.reviewReason =
+          `The subject says "${bySubject.why}" (${bySubject.eventType}), ` +
+          `but it was read as ${result.event_type}. One of the two is wrong.`;
+      }
+
       if (result.needsReview) {
         totalReview++;
         reviewQueue.review.unshift({
@@ -311,8 +439,7 @@ async function main() {
         continue; // not enough to file — err on the side of not creating junk records
       }
 
-      totalRelevant++;
-      applyEvent(manuscriptsDb, {
+      const filed = applyEvent(manuscriptsDb, {
         title: result.title,
         journal: result.journal,
         manuscriptNumber: result.manuscript_number || null,
@@ -340,6 +467,13 @@ async function main() {
         source,
         needsReview: result.needsReview || false,
       });
+
+      // A tombstoned paper is refused, on purpose: somebody deleted it and a
+      // later email must not rebuild it. Counted separately so a run that files
+      // nothing because everything was deleted does not read as a run that
+      // found nothing.
+      if (filed) totalRelevant++;
+      else totalSuppressed++;
     }
 
     if (sweeping) {
@@ -350,17 +484,22 @@ async function main() {
         `[${account.label}] sweep complete; sync window left at ${acctState.lastSyncedAt}.`
       );
     } else if (oldestUnprocessed) {
-      // Rewind to just before the oldest email still awaiting a decision.
+      // Rewind to just before the oldest email still awaiting a decision, and
+      // record that the window is held so the next run does not subtract the
+      // overlap from it as well.
       acctState.lastSyncedAt = oldestUnprocessed;
+      acctState.holding = true;
       console.log(
         `[${account.label}] holding sync window at ${oldestUnprocessed} — work remains.`
       );
     } else if (hitFetchCap) {
+      acctState.holding = true;
       console.log(
         `[${account.label}] fetch cap reached; leaving sync window in place for the next run.`
       );
     } else {
       acctState.lastSyncedAt = new Date().toISOString();
+      acctState.holding = false;
     }
 
     acctState.seenIds = Array.from(seenIds).slice(-MAX_SEEN_IDS_PER_ACCOUNT);
@@ -374,9 +513,20 @@ async function main() {
   excludedLog.excluded = excludedLog.excluded.slice(0, MAX_EXCLUDED_LOG);
   reviewQueue.review = reviewQueue.review.slice(0, MAX_REVIEW_QUEUE);
   manuscriptsDb.generatedAt = new Date().toISOString();
-  manuscriptsDb.manuscripts.sort(
-    (a, b) => new Date(b.updatedAt) - new Date(a.updatedAt)
-  );
+  /*
+   * Stored in a fixed order, not the order it is read in.
+   *
+   * This used to sort by updatedAt, so the two papers that moved in a run were
+   * lifted to the top and every line below them shifted: a run that changed two
+   * records of 128 produced a 5,912-line diff. The repository is this tracker's
+   * only audit trail -- the sole record of what it believed and when, and the
+   * only way back from a bad classification -- and every commit read as a total
+   * rewrite, so none of it could be reviewed.
+   *
+   * Sorting by id makes a commit show the papers that actually changed. The
+   * dashboard sorts for reading, which is where that belongs.
+   */
+  manuscriptsDb.manuscripts.sort((a, b) => a.id.localeCompare(b.id));
 
   await saveJson(P.manuscripts, manuscriptsDb);
   await saveJson(P.state, state);
@@ -386,9 +536,41 @@ async function main() {
   console.log(
     `Done. Inspected ${totalFetched}, classified ${totalClassified}, ` +
       `filed ${totalRelevant} manuscript event(s), excluded ${totalExcluded}, ` +
-      `flagged ${totalReview} for review, deferred ${totalDeferred} to the next run` +
+      `flagged ${totalReview} for review, ` +
+      (totalSuppressed ? `suppressed ${totalSuppressed} about deleted paper(s), ` : "") +
+      `deferred ${totalDeferred} to the next run` +
       (rateLimitedThisRun ? ` (${rateLimitedThisRun} of them rate limited).` : ".")
   );
+
+  /*
+   * A caller that cannot come back for the deferred mail needs to know there
+   * is any.
+   *
+   * A scheduled run defers freely: the window holds, and the next run an hour
+   * later picks the mail up. A backfill has no next run -- it advances its
+   * cursor to the following month and never looks back -- so a deferral there
+   * is mail dropped, not mail postponed.
+   *
+   * The January-to-August backfill deferred 4,590 messages and filed nothing
+   * at all, because the classifier's daily quota was already spent before it
+   * began. It exited 0 for every month and reported "Swept 7 month(s); 0
+   * failed". Seven months of history looked imported and none of it was, and
+   * that stood for three days.
+   */
+  if (process.env.SYNC_SUMMARY_FILE) {
+    await saveJson(process.env.SYNC_SUMMARY_FILE, {
+      since: SWEEP.since ? SWEEP.since.toISOString() : null,
+      until: SWEEP.until ? SWEEP.until.toISOString() : null,
+      fetched: totalFetched,
+      classified: totalClassified,
+      filed: totalRelevant,
+      excluded: totalExcluded,
+      review: totalReview,
+      suppressed: totalSuppressed,
+      deferred: totalDeferred,
+      rateLimited: rateLimitedThisRun,
+    });
+  }
 }
 
 main().catch((err) => {
